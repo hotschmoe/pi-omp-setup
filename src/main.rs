@@ -108,25 +108,9 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .context("Cannot create new output file (it may already exist)")?;
     #[cfg(windows)]
     {
-        // Protect the empty file before writing secrets into it.
-        let identity = std::process::Command::new("whoami")
-            .output()
-            .context("Cannot determine Windows user")?;
-        if !identity.status.success() {
-            bail!("Cannot determine Windows user");
-        }
-        let identity =
-            String::from_utf8(identity.stdout).context("Invalid Windows user identity")?;
-        let result = std::process::Command::new("icacls")
-            .arg(path)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(format!("{}:F", identity.trim()))
-            .output()
-            .context("Cannot protect output file")?;
-        if !result.status.success() {
-            bail!("Cannot protect output file");
-        }
+        // Protect the empty file before writing any bytes, using the same
+        // exact current-user DACL as client configuration files.
+        config::private(path, false)?;
     }
     file.write_all(bytes).context("Cannot write output file")?;
     file.sync_all().context("Cannot sync output file")?;

@@ -73,7 +73,7 @@ fn check_path(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn private(path: &Path, directory: bool) -> Result<()> {
+pub(crate) fn private(path: &Path, directory: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(
         path,
@@ -83,44 +83,39 @@ fn private(path: &Path, directory: bool) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn private(path: &Path, directory: bool) -> Result<()> {
-    use std::process::Command;
-    let identity = Command::new("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
+pub(crate) fn private(path: &Path, directory: bool) -> Result<()> {
+    // Construct a fresh protected DACL and apply it once: never reset an existing
+    // secret file to broader inherited permissions, even temporarily. Use only
+    // .NET APIs, since PowerShell module lookup can inherit another host's paths.
+    let script = r#"$ErrorActionPreference='Stop';
+$p=[IO.Path]::GetFullPath($env:PI_OMP_PRIVATE_PATH);
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;
+if ($env:PI_OMP_PRIVATE_DIRECTORY -eq '1') {
+    $acl=[Security.AccessControl.DirectorySecurity]::new();
+    $inherit=[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit';
+} else {
+    $acl=[Security.AccessControl.FileSecurity]::new();
+    $inherit=[Security.AccessControl.InheritanceFlags]::None;
+}
+$acl.SetAccessRuleProtection($true,$false);
+$rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow);
+$acl.AddAccessRule($rule);
+if ($env:PI_OMP_PRIVATE_DIRECTORY -eq '1') {
+    [IO.Directory]::SetAccessControl($p,$acl);
+} else {
+    [IO.File]::SetAccessControl($p,$acl);
+}"#;
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("PI_OMP_PRIVATE_PATH", path)
+        .env(
+            "PI_OMP_PRIVATE_DIRECTORY",
+            if directory { "1" } else { "0" },
+        )
         .output()
-        .context("Cannot identify current Windows user")?;
-    if !identity.status.success() {
-        bail!("Cannot identify current Windows user");
-    }
-    let text =
-        String::from_utf8(identity.stdout).context("Cannot identify current Windows user")?;
-    let sid = text
-        .trim()
-        .split(',')
-        .next_back()
-        .unwrap_or("")
-        .trim_matches('"');
-    if !sid.starts_with("S-1-")
-        || !sid
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == 'S' || c == '-')
-    {
-        bail!("Cannot identify current Windows user");
-    }
-    let grant = format!("*{sid}:{}F", if directory { "(OI)(CI)" } else { "" });
-    // Reset explicit ACL entries, then remove inheritance and grant only this user.
-    for args in [
-        vec!["/reset"],
-        vec!["/inheritance:r", "/grant:r", grant.as_str()],
-    ] {
-        let output = Command::new("icacls")
-            .arg(path)
-            .args(args)
-            .output()
-            .context("Cannot secure Windows configuration permissions")?;
-        if !output.status.success() {
-            bail!("Cannot secure Windows configuration permissions");
-        }
+        .context("Cannot secure Windows configuration permissions")?;
+    if !output.status.success() {
+        bail!("Cannot secure Windows configuration permissions");
     }
     Ok(())
 }
