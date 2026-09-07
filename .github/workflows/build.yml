@@ -50,6 +50,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./tests/installers.ps1
+      - name: Windows PowerShell 5.1 installer checks
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./tests/installers.ps1
       - name: Build native helper
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Stage Unix binary

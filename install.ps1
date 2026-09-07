@@ -20,6 +20,26 @@ function Get-SetupArchitecture {
 function Get-Download([string]$Url, [string]$Path) {
     Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Path
 }
+function Invoke-DownloadedInstaller([string]$Path, [hashtable]$Parameters) {
+    # A child process isolates upstream `exit` statements. Execute the downloaded
+    # text as a scriptblock so no file execution-policy change is needed.
+    $literalPath = "'" + $Path.Replace("'", "''") + "'"
+    $entries = foreach ($key in $Parameters.Keys) {
+        if ($key -notmatch '^[a-zA-Z][a-zA-Z0-9]*$') { throw 'Invalid installer parameter name' }
+        $value = $Parameters[$key]
+        if ($value -is [bool]) { $literal = if ($value) { '$true' } else { '$false' } }
+        elseif ($value -is [string]) { $literal = "'" + $value.Replace("'", "''") + "'" }
+        else { throw 'Unsupported installer parameter type' }
+        "'$key' = $literal"
+    }
+    $command = '$ErrorActionPreference = ''Stop''; $installerParameters = @{' + ($entries -join '; ') + '}; & ([scriptblock]::Create([IO.File]::ReadAllText(' + $literalPath + '))) @installerParameters'
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    $executable = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $executable)) { $executable = Join-Path $PSHOME 'powershell.exe' }
+    if (-not (Test-Path -LiteralPath $executable)) { $executable = Join-Path $PSHOME 'pwsh' }
+    & $executable -NoProfile -EncodedCommand $encoded
+    Assert-Exit 'Optional guard installer'
+}
 function Assert-Checksum([string]$Path, [string]$Manifest, [string]$Name) {
     $matches = @(Get-Content -LiteralPath $Manifest | Where-Object { $_ -match ('^[a-fA-F0-9]{64}\s+\*?' + [regex]::Escape($Name) + '$') })
     if ($matches.Count -ne 1) { throw "Missing/invalid checksum: $Name" }
@@ -109,7 +129,7 @@ function Invoke-Setup {
         if (Ask-Guard 'Destructive Command Guard (DCG)') {
             $installer = Join-Path $scratch 'dcg-install.ps1'
             Get-Download 'https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/v0.14.0/install.ps1' $installer
-            & $installer -Version v0.14.0 -EasyMode -NoConfigure -Dest $BinDir
+            Invoke-DownloadedInstaller $installer @{ Version = 'v0.14.0'; EasyMode = $true; NoConfigure = $true; Dest = $BinDir }
             $savedProfile = $env:OMP_PROFILE; $savedLegacyProfile = $env:PI_PROFILE; $savedAgentDir = $env:PI_CODING_AGENT_DIR
             try {
                 $env:OMP_PROFILE = 'default'; $env:PI_PROFILE = 'default'; $env:PI_CODING_AGENT_DIR = $OmpDir
@@ -134,7 +154,7 @@ function Invoke-Setup {
         if (Ask-Guard 'bang-guard') {
             $installer = Join-Path $scratch 'bang-install.ps1'
             Get-Download 'https://raw.githubusercontent.com/hotschmoe/bang-guard/v0.3.0/install.ps1' $installer
-            & $installer -Version v0.3.0 -Target Both -PiDir $PiDir -OmpDir $OmpDir
+            Invoke-DownloadedInstaller $installer @{ Version = 'v0.3.0'; Target = 'Both'; PiDir = $PiDir; OmpDir = $OmpDir }
         }
         Write-Host 'Installed. Open a new terminal and run pi or omp.'
     } finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
