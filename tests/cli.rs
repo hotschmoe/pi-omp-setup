@@ -138,7 +138,7 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
     {
         // Ask Windows for the actual DACL instead of matching localized icacls text.
         let checked = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach ($p in @('bundle.json','pi/models.json','pi/settings.json.bak','omp/models.yml')) { $acl=Get-Acl -LiteralPath $p; if (-not $acl.AreAccessRulesProtected) { throw 'Inherited ACL remained' }; foreach ($rule in $acl.Access) { if ($rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid) { throw 'Unexpected ACL principal' } } }"
+            "$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach ($p in @('bundle.json','pi/models.json','pi/settings.json.bak','omp/models.yml')) { $acl=[IO.File]::GetAccessControl([IO.Path]::GetFullPath($p)); if (-not $acl.AreAccessRulesProtected) { throw 'Inherited ACL remained' }; foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) { if ($rule.IdentityReference.Value -ne $sid) { throw 'Unexpected ACL principal' } } }"
         ]).current_dir(root).output().unwrap();
         assert!(
             checked.status.success(),
