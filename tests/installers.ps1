@@ -42,6 +42,9 @@ try {
     $rejected = $false
     try { Invoke-DownloadedInstaller $child @{} } catch { $rejected = $true }
     if (-not $rejected) { throw 'Child installer failure was ignored' }
+    # GitHub's PowerShell wrapper checks LASTEXITCODE after the script returns.
+    # The deliberate exit-7 probe was handled successfully above.
+    $global:LASTEXITCODE = 0
     Write-Host 'PowerShell architecture, checksums, mock downloads, and child installer checks passed.' 
 } finally {
     $env:PROCESSOR_ARCHITECTURE = $originalArch; $env:PROCESSOR_ARCHITEW6432 = $originalWow
