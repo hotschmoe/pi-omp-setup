@@ -1,0 +1,10 @@
+{
+  "format": "pi-omp-setup-v1",
+  "kdf": "argon2id-v19",
+  "memory_kib": 65536,
+  "iterations": 3,
+  "parallelism": 1,
+  "salt": "t7SL7Y2Qn8ojD7Tv3NV3hA==",
+  "nonce": "D63YqFISYeCjBKFB",
+  "ciphertext": "0/K9PVG6lJT5yLDERw++nFRRc7Z1EjJ82AlR74bU1dlk+Gs+6A1ATxTmAF+0L69BOcOUOhcSXk72PMwdPnfBMDzvFEEcLAnnoIm3pjDLSIQJM3MHjEMJD365vPOL0LukTykStV8zAdgC242AVHa4Hq+zgqGSah5XE20p2Cut2A/+YZWJOux/HVMgLpRYBwpHcj12BoAj/vNW8snR0b7h"
+}

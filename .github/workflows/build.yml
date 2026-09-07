@@ -1,0 +1,76 @@
+name: Build and test
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: pi-omp-setup-linux-x64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: pi-omp-setup-linux-arm64
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            asset: pi-omp-setup-windows-x64.exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: pi-omp-setup-windows-arm64.exe
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: pi-omp-setup-macos-x64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: pi-omp-setup-macos-arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Rust tests
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Unix installer checks
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash tests/installers.sh
+      - name: Windows installer checks
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/installers.ps1
+      - name: Build native helper
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Stage Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/pi-omp-setup dist/${{ matrix.asset }}
+          chmod +x dist/${{ matrix.asset }}
+          dist/${{ matrix.asset }} --version
+      - name: Stage Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item 'target/${{ matrix.target }}/release/pi-omp-setup.exe' 'dist/${{ matrix.asset }}'
+          & './dist/${{ matrix.asset }}' --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 14

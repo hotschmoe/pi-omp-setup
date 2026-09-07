@@ -1,0 +1,27 @@
+[package]
+name = "pi-omp-setup"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Decrypt and install private model settings for Pi and OMP"
+repository = "https://github.com/hotschmoe/pi-omp-setup"
+
+[dependencies]
+aes-gcm = "0.10.3"
+anyhow = "1"
+argon2 = "0.5.3"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+rand = "0.8"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+tempfile = "3"
+url = "2"
+zeroize = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

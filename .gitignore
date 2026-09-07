@@ -1,0 +1,7 @@
+/target/
+*.private.*
+*.plaintext.*
+passphrase*
+password*
+secrets/
+.DS_Store
