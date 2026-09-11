@@ -88,7 +88,7 @@ main() {
     verify "$scratch/$omp_asset" "$scratch/omp.sha256" "$omp_asset"
     install -m 755 "$scratch/$omp_asset" "$bin_dir/omp"
   fi
-  base=https://github.com/hotschmoe/pi-omp-setup/releases/download/v0.1.0
+  base=https://github.com/hotschmoe/pi-omp-setup/releases/download/v0.1.1
   download "$base/$helper_asset" "$scratch/$helper_asset"
   download "$base/config.enc.json" "$scratch/config.enc.json"
   download "$base/SHA256SUMS" "$scratch/setup.sha256"

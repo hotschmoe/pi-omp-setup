@@ -9,13 +9,13 @@ You need the **six randomly chosen words** supplied privately by the maintainer.
 Linux or macOS, from an interactive terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.1.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.1.1/install.sh | bash
 ```
 
 Windows, from PowerShell 5.1 or newer:
 
 ```powershell
-& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.1.0/install.ps1).Content))
+& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.1.1/install.ps1).Content))
 ```
 
 Enter the private passphrase when asked. Then choose whether to install **Destructive Command Guard (DCG)** and **bang-guard**; each defaults to yes when you press Enter. Open a new terminal and run `pi` or `omp`.
@@ -34,7 +34,7 @@ Linux helper builds target Ubuntu 22.04's glibc baseline or newer. Alpine/musl L
 
 | Component | Version |
 | --- | --- |
-| Setup helper and encrypted bundle | `v0.1.0` |
+| Setup helper and encrypted bundle | `v0.1.1` |
 | Pi | `v0.85.1` |
 | OMP | `v18.1.14` |
 | DCG, optional | `v0.14.0` |
@@ -52,6 +52,15 @@ The Rust helper decrypts the bundle **locally** and merges the model into these 
 | Pi | `~/.pi/agent/models.json` | `~/.pi/agent/settings.json` |
 | OMP | `~/.omp/agent/models.yml` | `~/.omp/agent/config.yml` |
 
+Both clients use **200,000 context**, **32,768 total output tokens**,
+**8,192 thinking tokens**, **medium reasoning effort**, and a **40,000-token
+compaction reserve**. Output includes reasoning and the answer/tool calls.
+PI uses its dynamic vLLM thinking-budget support; OMP 18.1.14 sends a fixed
+8,192 budget only on reasoning-enabled requests. Changing OMP's effort selector
+does not change that numeric cap. Qwen thinking history is preserved.
+Restart existing clients after reconfiguration. These defaults are a practical
+starting point for this endpoint, not universal model recommendations.
+
 Existing OMP `.yaml` files are respected. Unrelated settings and providers are preserved, and changed files receive numbered backups. Repeating the same setup is idempotent. Invalid bundles or incorrect passphrases are rejected before client settings are changed.
 
 The client files contain the decrypted credentials so Pi and OMP can connect normally. The helper restricts access using Unix file permissions or Windows ACLs; backups need the same protection. Do not publish these files or their backups. A public encrypted bundle allows offline passphrase guesses, so use six randomly selected EFF-list words, not a memorable sentence. Anyone with the passphrase can recover the API key. Share the passphrase privately and keep it out of shell history, screenshots, and Git. Changing the passphrase does not revoke old ciphertext or its API key; revoke or rotate the underlying key if access must be withdrawn.
@@ -63,12 +72,12 @@ DCG installs its native OMP extension and this project's Pi adapter. bang-guard 
 Download the installer first when passing options:
 
 ```bash
-curl -fsSLo install.sh https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.1.0/install.sh
+curl -fsSLo install.sh https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.1.1/install.sh
 bash install.sh --no-guards
 ```
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.1.0/install.ps1 -OutFile install.ps1
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.1.1/install.ps1 -OutFile install.ps1
 & .\install.ps1 -NoGuards
 ```
 

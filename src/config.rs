@@ -183,7 +183,7 @@ fn child<'a>(value: &'a mut Value, key: &str) -> Result<&'a mut Value> {
     Ok(entry)
 }
 
-fn merge_models(value: &mut Value, config: &ModelConfig, endpoint: &str) -> Result<()> {
+fn merge_models(value: &mut Value, config: &ModelConfig, endpoint: &str, omp: bool) -> Result<()> {
     let provider = child(child(value, "providers")?, PROVIDER)?;
     let obj = object(provider)?;
     obj.insert("baseUrl".into(), json!(endpoint));
@@ -220,12 +220,36 @@ fn merge_models(value: &mut Value, config: &ModelConfig, endpoint: &str) -> Resu
     }
     let compat = object(child(model, "compat")?)?;
     for (key, value) in [
-        ("supportsReasoningEffort", json!(false)),
+        ("supportsReasoningEffort", json!(true)),
         ("supportsDeveloperRole", json!(false)),
         ("supportsStore", json!(false)),
         ("maxTokensField", json!("max_tokens")),
     ] {
         compat.insert(key.into(), value);
+    }
+    if omp {
+        compat.insert("thinkingFormat".into(), json!("qwen-chat-template"));
+        compat.insert("qwenTemplateReasoningEffort".into(), json!(true));
+        compat.insert("qwenPreserveThinking".into(), json!(true));
+        compat.insert("reasoningContentField".into(), json!("reasoning"));
+        // OMP 18.1.14 has no PI-style dynamic thinkingTokenBudgetField.
+        // Keep the numeric cap scoped to reasoning-enabled requests.
+        let when = child(model, "compat")?;
+        let when = child(when, "whenThinking")?;
+        object(child(when, "extraBody")?)?.insert("thinking_token_budget".into(), json!(8192));
+    } else {
+        compat.insert("thinkingFormat".into(), json!("chat-template"));
+        compat.insert(
+            "thinkingTokenBudgetField".into(),
+            json!("thinking_token_budget"),
+        );
+        compat.insert(
+            "chatTemplateKwargs".into(),
+            json!({
+                "enable_thinking": {"$var": "thinking.enabled"}, "preserve_thinking": true,
+                "reasoning_effort": {"$var": "thinking.effort"}
+            }),
+        );
     }
     Ok(())
 }
@@ -330,7 +354,7 @@ pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path) -> Result<
     ] {
         let mut after = before.clone();
         if models {
-            merge_models(&mut after, config, &endpoint)?;
+            merge_models(&mut after, config, &endpoint, yaml)?;
         } else if yaml {
             object(child(&mut after, "modelRoles")?)?.insert(
                 "default".into(),
@@ -339,6 +363,11 @@ pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path) -> Result<
         } else {
             object(&mut after)?.insert("defaultProvider".into(), json!(PROVIDER));
             object(&mut after)?.insert("defaultModel".into(), json!(config.model_id));
+        }
+        if !models {
+            object(&mut after)?.insert("defaultThinkingLevel".into(), json!("medium"));
+            object(child(&mut after, "thinkingBudgets")?)?.insert("medium".into(), json!(8192));
+            object(child(&mut after, "compaction")?)?.insert("reserveTokens".into(), json!(40000));
         }
         if let Some(change) = stage(path, before, after, yaml)? {
             changes.push(change);
@@ -422,6 +451,28 @@ mod tests {
             read(&omp.join("config.yml"), true).unwrap()["modelRoles"]["default"],
             "hotschmoe-local/hotschmoe-dd"
         );
+        let pm = read(&pi.join("models.json"), false).unwrap();
+        let pc = &pm["providers"][PROVIDER]["models"][0]["compat"];
+        assert_eq!(pc["thinkingTokenBudgetField"], "thinking_token_budget");
+        assert_eq!(
+            pc["chatTemplateKwargs"]["reasoning_effort"]["$var"],
+            "thinking.effort"
+        );
+        let oc = &m["providers"][PROVIDER]["models"][0]["compat"];
+        assert_eq!(oc["qwenTemplateReasoningEffort"], true);
+        assert_eq!(
+            oc["whenThinking"]["extraBody"]["thinking_token_budget"],
+            8192
+        );
+        for (path, yaml) in [
+            (pi.join("settings.json"), false),
+            (omp.join("config.yml"), true),
+        ] {
+            let settings = read(&path, yaml).unwrap();
+            assert_eq!(settings["defaultThinkingLevel"], "medium");
+            assert_eq!(settings["thinkingBudgets"]["medium"], 8192);
+            assert_eq!(settings["compaction"]["reserveTokens"], 40000);
+        }
         configure(&config(), &pi, &omp).unwrap();
         assert!(!pi.join("models.json.bak").exists());
         #[cfg(unix)]
@@ -527,7 +578,7 @@ mod tests {
                 {"id": DEFAULT_MODEL, "compat": {"supportsUsageInStreaming": false}, "headers": {"X-Model": "preserved"}}
             ]
         }}});
-        merge_models(&mut value, &config(), "https://example.invalid/v1").unwrap();
+        merge_models(&mut value, &config(), "https://example.invalid/v1", false).unwrap();
         let provider = &value["providers"][PROVIDER];
         assert_eq!(provider["headers"]["X-Custom"], "preserved");
         assert_eq!(provider["models"][0]["name"], "Existing");
@@ -537,7 +588,7 @@ mod tests {
         );
         assert_eq!(
             provider["models"][1]["compat"]["supportsReasoningEffort"],
-            false
+            true
         );
         assert_eq!(provider["models"][1]["headers"]["X-Model"], "preserved");
     }

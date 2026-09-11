@@ -115,7 +115,7 @@ function Invoke-Setup {
             Assert-Checksum (Join-Path $scratch $ompAsset) (Join-Path $scratch 'omp.sha256') $ompAsset
             Copy-Item -LiteralPath (Join-Path $scratch $ompAsset) -Destination (Join-Path $BinDir 'omp.exe') -Force
         }
-        $base = 'https://github.com/hotschmoe/pi-omp-setup/releases/download/v0.1.0'
+        $base = 'https://github.com/hotschmoe/pi-omp-setup/releases/download/v0.1.1'
         Get-Download "$base/$helperAsset" (Join-Path $scratch $helperAsset)
         Get-Download "$base/config.enc.json" (Join-Path $scratch 'config.enc.json')
         Get-Download "$base/SHA256SUMS" (Join-Path $scratch 'setup.sha256')
