@@ -74,15 +74,12 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
             "wrong.txt",
             "--pi-dir",
             "pi",
-            "--omp-dir",
-            "omp",
         ],
         root,
     );
     assert!(!wrong.status.success());
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("Incorrect passphrase"));
     assert!(!root.join("pi").exists());
-    assert!(!root.join("omp").exists());
     fs::create_dir(root.join("pi")).unwrap();
     let settings = br#"{"theme":"existing-theme","unrelated":true}"#;
     fs::write(root.join("pi/settings.json"), settings).unwrap();
@@ -94,8 +91,6 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
         "password.txt",
         "--pi-dir",
         "pi",
-        "--omp-dir",
-        "omp",
     ];
     let configured = run(&args, root);
     assert!(
@@ -114,20 +109,15 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
         fs::read(root.join("pi/settings.json.bak")).unwrap(),
         settings
     );
-    let omp: serde_json::Value =
-        serde_yaml_ng::from_slice(&fs::read(root.join("omp/config.yml")).unwrap()).unwrap();
-    assert_eq!(omp["modelRoles"]["default"], "hotschmoe-local/hotschmoe-dd");
+    let settings_after: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("pi/settings.json")).unwrap()).unwrap();
+    assert_eq!(settings_after["defaultProvider"], "hotschmoe-local");
     assert!(run(&args, root).status.success());
     assert!(!root.join("pi/settings.json.bak.1").exists());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for path in [
-            "bundle.json",
-            "pi/models.json",
-            "pi/settings.json.bak",
-            "omp/models.yml",
-        ] {
+        for path in ["bundle.json", "pi/models.json", "pi/settings.json.bak"] {
             assert_eq!(
                 fs::metadata(root.join(path)).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -138,7 +128,7 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
     {
         // Ask Windows for the actual DACL instead of matching localized icacls text.
         let checked = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach ($p in @('bundle.json','pi/models.json','pi/settings.json.bak','omp/models.yml')) { $acl=[IO.File]::GetAccessControl([IO.Path]::GetFullPath($p)); if (-not $acl.AreAccessRulesProtected) { throw 'Inherited ACL remained' }; foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) { if ($rule.IdentityReference.Value -ne $sid) { throw ('Unexpected ACL principal for {0}: {1}, expected {2}' -f $p,$rule.IdentityReference.Value,$sid) } } }"
+            "$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach ($p in @('bundle.json','pi/models.json','pi/settings.json.bak')) { $acl=[IO.File]::GetAccessControl([IO.Path]::GetFullPath($p)); if (-not $acl.AreAccessRulesProtected) { throw 'Inherited ACL remained' }; foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) { if ($rule.IdentityReference.Value -ne $sid) { throw ('Unexpected ACL principal for {0}: {1}, expected {2}' -f $p,$rule.IdentityReference.Value,$sid) } } }"
         ]).current_dir(root).output().unwrap();
         assert!(
             checked.status.success(),

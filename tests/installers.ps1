@@ -28,24 +28,26 @@ try {
     function Invoke-WebRequest { param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile) [IO.File]::WriteAllText($OutFile, $Uri) }
     Get-Download 'https://example.invalid/asset' (Join-Path $scratch 'space name')
     if ([IO.File]::ReadAllText((Join-Path $scratch 'space name')) -ne 'https://example.invalid/asset') { throw 'Mock download path failed' }
-    # Upstream DCG uses exit even on success: it must not terminate our caller.
-    # Metacharacters in named arguments must remain literal across the child CLI.
-    $child = Join-Path $scratch "child ' installer.ps1"
-    $observed = Join-Path $scratch 'observed.txt'
-    $literalValue = 'spaces '' apostrophe $(throw "injected") ` dollar $'
-    [IO.File]::WriteAllText($child, 'param([string]$Output, [string]$Value, [switch]$Enabled); if (-not $Enabled) { exit 4 }; [IO.File]::WriteAllText($Output, $Value); exit 0')
-    $policyBefore = Get-ExecutionPolicy -List | Out-String
-    Invoke-DownloadedInstaller $child @{ Output = $observed; Value = $literalValue; Enabled = $true }
-    if ([IO.File]::ReadAllText($observed) -cne $literalValue) { throw 'Child installer arguments changed' }
-    if ((Get-ExecutionPolicy -List | Out-String) -cne $policyBefore) { throw 'Execution policy changed' }
-    [IO.File]::WriteAllText($child, 'exit 7')
-    $rejected = $false
-    try { Invoke-DownloadedInstaller $child @{} } catch { $rejected = $true }
-    if (-not $rejected) { throw 'Child installer failure was ignored' }
-    # GitHub's PowerShell wrapper checks LASTEXITCODE after the script returns.
-    # The deliberate exit-7 probe was handled successfully above.
-    $global:LASTEXITCODE = 0
-    Write-Host 'PowerShell architecture, checksums, mock downloads, and child installer checks passed.' 
+    # Node archive selection ignores unrelated artifacts.
+    [IO.File]::WriteAllText($manifest, ("a" * 64) + "  node-v24.1.0-win-x64.7z`n" + ("b" * 64) + "  node-v24.1.0-win-x64.zip`n" + ("c" * 64) + "  node-v24.1.0-win-arm64.zip`n")
+    if ((Get-NodeAsset 'x64' $manifest) -ne 'node-v24.1.0-win-x64.zip') { throw 'Node x64 asset selection failed' }
+    if ((Get-NodeAsset 'arm64' $manifest) -ne 'node-v24.1.0-win-arm64.zip') { throw 'Node ARM64 asset selection failed' }
+    # Legacy cleanup removes only what earlier installers created.
+    $script:BinDir = Join-Path $scratch 'bin'; $script:DataDir = Join-Path $scratch 'data'; $script:PiDir = Join-Path $scratch 'pi'
+    $legacyOmp = Join-Path $scratch 'omp'
+    New-Item -ItemType Directory -Path $BinDir, (Join-Path $DataDir 'pi-v0.85.1'), (Join-Path $PiDir 'extensions'), (Join-Path $legacyOmp 'extensions') | Out-Null
+    foreach ($name in 'omp.exe','dcg.exe','pi.cmd','pi-omp-setup.exe') { [IO.File]::WriteAllText((Join-Path $BinDir $name), 'x') }
+    [IO.File]::WriteAllText((Join-Path $PiDir 'extensions\dcg-pi.ts'), "// pi-omp-setup: managed dcg extension`n")
+    [IO.File]::WriteAllText((Join-Path $PiDir 'extensions\bang-guard.ts'), "// bang-guard: managed extension`n")
+    [IO.File]::WriteAllText((Join-Path $legacyOmp 'extensions\bang-guard.ts'), "// my own extension`n")
+    Remove-LegacyInstall $legacyOmp 6>$null 3>$null
+    foreach ($gone in 'bin\omp.exe','bin\dcg.exe','bin\pi.cmd','data\pi-v0.85.1','pi\extensions\dcg-pi.ts','pi\extensions\bang-guard.ts') {
+        if (Test-Path -LiteralPath (Join-Path $scratch $gone)) { throw "Cleanup left $gone" }
+    }
+    foreach ($kept in 'bin\pi-omp-setup.exe','omp\extensions\bang-guard.ts') {
+        if (-not (Test-Path -LiteralPath (Join-Path $scratch $kept))) { throw "Cleanup removed $kept" }
+    }
+    Write-Host 'PowerShell architecture, checksums, mock downloads, Node selection, and cleanup checks passed.' 
 } finally {
     $env:PROCESSOR_ARCHITECTURE = $originalArch; $env:PROCESSOR_ARCHITEW6432 = $originalWow
     Remove-Item -LiteralPath $scratch -Recurse -Force

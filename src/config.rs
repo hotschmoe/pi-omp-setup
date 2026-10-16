@@ -145,7 +145,7 @@ fn directory(path: &Path) -> Result<()> {
     private(path, true)
 }
 
-fn read(path: &Path, yaml: bool) -> Result<Value> {
+fn read(path: &Path) -> Result<Value> {
     check_path(path)?;
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if !metadata.is_file() {
@@ -157,13 +157,8 @@ fn read(path: &Path, yaml: bool) -> Result<Value> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
         Err(_) => bail!("Cannot read existing configuration"),
     };
-    let value: Value = if yaml {
-        serde_yaml_ng::from_slice(&data)
-            .map_err(|_| anyhow::anyhow!("Existing YAML configuration is malformed"))?
-    } else {
-        serde_json::from_slice(&data)
-            .map_err(|_| anyhow::anyhow!("Existing JSON configuration is malformed"))?
-    };
+    let value: Value = serde_json::from_slice(&data)
+        .map_err(|_| anyhow::anyhow!("Existing JSON configuration is malformed"))?;
     if !value.is_object() {
         bail!("Existing configuration must contain an object");
     }
@@ -183,7 +178,7 @@ fn child<'a>(value: &'a mut Value, key: &str) -> Result<&'a mut Value> {
     Ok(entry)
 }
 
-fn merge_models(value: &mut Value, config: &ModelConfig, endpoint: &str, omp: bool) -> Result<()> {
+fn merge_models(value: &mut Value, config: &ModelConfig, endpoint: &str) -> Result<()> {
     let provider = child(child(value, "providers")?, PROVIDER)?;
     let obj = object(provider)?;
     obj.insert("baseUrl".into(), json!(endpoint));
@@ -227,30 +222,18 @@ fn merge_models(value: &mut Value, config: &ModelConfig, endpoint: &str, omp: bo
     ] {
         compat.insert(key.into(), value);
     }
-    if omp {
-        compat.insert("thinkingFormat".into(), json!("qwen-chat-template"));
-        compat.insert("qwenTemplateReasoningEffort".into(), json!(true));
-        compat.insert("qwenPreserveThinking".into(), json!(true));
-        compat.insert("reasoningContentField".into(), json!("reasoning"));
-        // OMP 18.1.14 has no PI-style dynamic thinkingTokenBudgetField.
-        // Keep the numeric cap scoped to reasoning-enabled requests.
-        let when = child(model, "compat")?;
-        let when = child(when, "whenThinking")?;
-        object(child(when, "extraBody")?)?.insert("thinking_token_budget".into(), json!(8192));
-    } else {
-        compat.insert("thinkingFormat".into(), json!("chat-template"));
-        compat.insert(
-            "thinkingTokenBudgetField".into(),
-            json!("thinking_token_budget"),
-        );
-        compat.insert(
-            "chatTemplateKwargs".into(),
-            json!({
-                "enable_thinking": {"$var": "thinking.enabled"}, "preserve_thinking": true,
-                "reasoning_effort": {"$var": "thinking.effort"}
-            }),
-        );
-    }
+    compat.insert("thinkingFormat".into(), json!("chat-template"));
+    compat.insert(
+        "thinkingTokenBudgetField".into(),
+        json!("thinking_token_budget"),
+    );
+    compat.insert(
+        "chatTemplateKwargs".into(),
+        json!({
+            "enable_thinking": {"$var": "thinking.enabled"}, "preserve_thinking": true,
+            "reasoning_effort": {"$var": "thinking.effort"}
+        }),
+    );
     Ok(())
 }
 
@@ -259,7 +242,7 @@ struct Change {
     old: Option<Vec<u8>>,
     data: Vec<u8>,
 }
-fn stage(path: PathBuf, before: Value, after: Value, yaml: bool) -> Result<Option<Change>> {
+fn stage(path: PathBuf, before: Value, after: Value) -> Result<Option<Change>> {
     check_path(&path)?;
     if before == after && path.exists() {
         return Ok(None);
@@ -269,16 +252,8 @@ fn stage(path: PathBuf, before: Value, after: Value, yaml: bool) -> Result<Optio
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => bail!("Cannot read existing configuration"),
     };
-    let data = if yaml {
-        serde_yaml_ng::to_string(&after)
-            .map_err(|_| anyhow::anyhow!("Cannot serialize configuration"))?
-            .into_bytes()
-    } else {
-        let mut data =
-            serde_json::to_vec_pretty(&after).context("Cannot serialize configuration")?;
-        data.push(b'\n');
-        data
-    };
+    let mut data = serde_json::to_vec_pretty(&after).context("Cannot serialize configuration")?;
+    data.push(b'\n');
     Ok(Some(Change { path, old, data }))
 }
 
@@ -302,79 +277,32 @@ fn atomic(path: &Path, data: &[u8], no_clobber: bool) -> Result<()> {
     Ok(())
 }
 
-fn select_yaml(dir: &Path, stem: &str) -> Result<(PathBuf, Value)> {
-    for extension in ["yml", "yaml"] {
-        let path = dir.join(format!("{stem}.{extension}"));
-        check_path(&path)?;
-        if path.exists() {
-            return Ok((path.clone(), read(&path, true)?));
-        }
-    }
-    let legacy = dir.join(if stem == "config" {
-        "settings.json"
-    } else {
-        "models.json"
-    });
-    if stem == "config" && dir.join("agent.db").exists() {
-        bail!(
-            "Run omp once to migrate legacy database settings before configuring this installation"
-        );
-    }
-    Ok((dir.join(format!("{stem}.yml")), read(&legacy, false)?))
-}
-
-/// Merge the private model into both clients. Never contacts the endpoint.
+/// Merge the private model into Pi. Never contacts the endpoint.
 /// All documents are parsed and validated before any configuration is replaced.
-pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path) -> Result<()> {
+pub fn configure(config: &ModelConfig, pi_dir: &Path) -> Result<()> {
     let endpoint = base_url(config)?;
     check_path(pi_dir)?;
-    check_path(omp_dir)?;
     let mut changes = Vec::new();
-    for (path, before, yaml, models) in [
-        (
-            pi_dir.join("models.json"),
-            read(&pi_dir.join("models.json"), false)?,
-            false,
-            true,
-        ),
-        (
-            pi_dir.join("settings.json"),
-            read(&pi_dir.join("settings.json"), false)?,
-            false,
-            false,
-        ),
-        {
-            let (p, v) = select_yaml(omp_dir, "models")?;
-            (p, v, true, true)
-        },
-        {
-            let (p, v) = select_yaml(omp_dir, "config")?;
-            (p, v, true, false)
-        },
+    for (path, models) in [
+        (pi_dir.join("models.json"), true),
+        (pi_dir.join("settings.json"), false),
     ] {
+        let before = read(&path)?;
         let mut after = before.clone();
         if models {
-            merge_models(&mut after, config, &endpoint, yaml)?;
-        } else if yaml {
-            object(child(&mut after, "modelRoles")?)?.insert(
-                "default".into(),
-                json!(format!("{PROVIDER}/{}", config.model_id)),
-            );
+            merge_models(&mut after, config, &endpoint)?;
         } else {
             object(&mut after)?.insert("defaultProvider".into(), json!(PROVIDER));
             object(&mut after)?.insert("defaultModel".into(), json!(config.model_id));
-        }
-        if !models {
             object(&mut after)?.insert("defaultThinkingLevel".into(), json!("medium"));
             object(child(&mut after, "thinkingBudgets")?)?.insert("medium".into(), json!(8192));
             object(child(&mut after, "compaction")?)?.insert("reserveTokens".into(), json!(40000));
         }
-        if let Some(change) = stage(path, before, after, yaml)? {
+        if let Some(change) = stage(path, before, after)? {
             changes.push(change);
         }
     }
     directory(pi_dir)?;
-    directory(omp_dir)?;
     for change in changes {
         check_path(&change.path)?;
         if let Some(old) = &change.old {
@@ -403,12 +331,7 @@ pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path) -> Result<
         atomic(&change.path, &change.data, false)?;
     }
     // Also harden files when content was already correct.
-    for path in [
-        pi_dir.join("models.json"),
-        pi_dir.join("settings.json"),
-        select_yaml(omp_dir, "models")?.0,
-        select_yaml(omp_dir, "config")?.0,
-    ] {
+    for path in [pi_dir.join("models.json"), pi_dir.join("settings.json")] {
         private(&path, false)?;
     }
     Ok(())
@@ -432,48 +355,31 @@ mod tests {
     fn fresh_defaults_and_idempotence() {
         let tmp = scratch();
         let pi = tmp.path().join("pi");
-        let omp = tmp.path().join("omp");
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&config(), &pi).unwrap();
         assert_eq!(
-            read(&pi.join("settings.json"), false).unwrap()["defaultModel"],
+            read(&pi.join("settings.json")).unwrap()["defaultModel"],
             DEFAULT_MODEL
         );
-        let m = read(&omp.join("models.yml"), true).unwrap();
+        let pm = read(&pi.join("models.json")).unwrap();
         assert_eq!(
-            m["providers"][PROVIDER]["baseUrl"],
+            pm["providers"][PROVIDER]["baseUrl"],
             "https://example.invalid/v1"
         );
         assert_eq!(
-            m["providers"][PROVIDER]["models"][0]["contextWindow"],
+            pm["providers"][PROVIDER]["models"][0]["contextWindow"],
             200000
         );
-        assert_eq!(
-            read(&omp.join("config.yml"), true).unwrap()["modelRoles"]["default"],
-            "hotschmoe-local/hotschmoe-dd"
-        );
-        let pm = read(&pi.join("models.json"), false).unwrap();
         let pc = &pm["providers"][PROVIDER]["models"][0]["compat"];
         assert_eq!(pc["thinkingTokenBudgetField"], "thinking_token_budget");
         assert_eq!(
             pc["chatTemplateKwargs"]["reasoning_effort"]["$var"],
             "thinking.effort"
         );
-        let oc = &m["providers"][PROVIDER]["models"][0]["compat"];
-        assert_eq!(oc["qwenTemplateReasoningEffort"], true);
-        assert_eq!(
-            oc["whenThinking"]["extraBody"]["thinking_token_budget"],
-            8192
-        );
-        for (path, yaml) in [
-            (pi.join("settings.json"), false),
-            (omp.join("config.yml"), true),
-        ] {
-            let settings = read(&path, yaml).unwrap();
-            assert_eq!(settings["defaultThinkingLevel"], "medium");
-            assert_eq!(settings["thinkingBudgets"]["medium"], 8192);
-            assert_eq!(settings["compaction"]["reserveTokens"], 40000);
-        }
-        configure(&config(), &pi, &omp).unwrap();
+        let settings = read(&pi.join("settings.json")).unwrap();
+        assert_eq!(settings["defaultThinkingLevel"], "medium");
+        assert_eq!(settings["thinkingBudgets"]["medium"], 8192);
+        assert_eq!(settings["compaction"]["reserveTokens"], 40000);
+        configure(&config(), &pi).unwrap();
         assert!(!pi.join("models.json.bak").exists());
         #[cfg(unix)]
         {
@@ -496,34 +402,20 @@ mod tests {
     fn preserves_and_backs_up() {
         let tmp = scratch();
         let pi = tmp.path().join("pi");
-        let omp = tmp.path().join("omp");
         directory(&pi).unwrap();
-        directory(&omp).unwrap();
         let original = br#"{"theme":"dark","custom":{"a":1}}"#;
         fs::write(pi.join("settings.json"), original).unwrap();
-        fs::write(
-            omp.join("config.yaml"),
-            "modelRoles:\n  smol: existing/model\ntheme:\n  dark: custom\n",
-        )
-        .unwrap();
         fs::write(pi.join("auth.json"), "opaque unchanged bytes").unwrap();
         fs::write(
-            omp.join("models.json"),
+            pi.join("models.json"),
             r#"{"providers":{"other":{"apiKey":"keep","models":[]}}}"#,
         )
         .unwrap();
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&config(), &pi).unwrap();
         assert_eq!(fs::read(pi.join("settings.json.bak")).unwrap(), original);
+        assert_eq!(read(&pi.join("settings.json")).unwrap()["custom"]["a"], 1);
         assert_eq!(
-            read(&pi.join("settings.json"), false).unwrap()["custom"]["a"],
-            1
-        );
-        assert_eq!(
-            read(&omp.join("config.yaml"), true).unwrap()["modelRoles"]["smol"],
-            "existing/model"
-        );
-        assert_eq!(
-            read(&omp.join("models.yml"), true).unwrap()["providers"]["other"]["apiKey"],
+            read(&pi.join("models.json")).unwrap()["providers"]["other"]["apiKey"],
             "keep"
         );
         assert_eq!(
@@ -532,8 +424,8 @@ mod tests {
         );
         let mut updated = config();
         updated.api_key = "changed-placeholder".into();
-        configure(&updated, &pi, &omp).unwrap();
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&updated, &pi).unwrap();
+        configure(&config(), &pi).unwrap();
         assert!(pi.join("models.json.bak.1").exists());
     }
     #[test]
@@ -547,26 +439,25 @@ mod tests {
         ] {
             let tmp = scratch();
             let pi = tmp.path().join("pi");
-            let omp = tmp.path().join("omp");
             directory(&pi).unwrap();
             fs::write(pi.join("models.json"), bad).unwrap();
-            assert!(configure(&config(), &pi, &omp).is_err());
+            assert!(configure(&config(), &pi).is_err());
             assert_eq!(fs::read_to_string(pi.join("models.json")).unwrap(), bad);
-            assert!(!omp.exists());
         }
     }
     #[test]
     fn validates_all_documents_before_replacing_any() {
         let tmp = scratch();
         let pi = tmp.path().join("pi");
-        let omp = tmp.path().join("omp");
         directory(&pi).unwrap();
-        directory(&omp).unwrap();
         fs::write(pi.join("models.json"), "{}").unwrap();
-        fs::write(omp.join("config.yml"), "modelRoles: []\n").unwrap();
-        assert!(configure(&config(), &pi, &omp).is_err());
+        fs::write(pi.join("settings.json"), "{\"compaction\":[]}").unwrap();
+        assert!(configure(&config(), &pi).is_err());
         assert_eq!(fs::read_to_string(pi.join("models.json")).unwrap(), "{}");
-        assert!(!pi.join("settings.json").exists());
+        assert_eq!(
+            fs::read_to_string(pi.join("settings.json")).unwrap(),
+            "{\"compaction\":[]}"
+        );
         assert!(!pi.join("models.json.bak").exists());
     }
     #[test]
@@ -578,7 +469,7 @@ mod tests {
                 {"id": DEFAULT_MODEL, "compat": {"supportsUsageInStreaming": false}, "headers": {"X-Model": "preserved"}}
             ]
         }}});
-        merge_models(&mut value, &config(), "https://example.invalid/v1", false).unwrap();
+        merge_models(&mut value, &config(), "https://example.invalid/v1").unwrap();
         let provider = &value["providers"][PROVIDER];
         assert_eq!(provider["headers"]["X-Custom"], "preserved");
         assert_eq!(provider["models"][0]["name"], "Existing");
@@ -620,15 +511,14 @@ mod tests {
         use std::os::unix::fs::symlink;
         let tmp = scratch();
         let pi = tmp.path().join("pi");
-        let omp = tmp.path().join("omp");
         directory(&pi).unwrap();
         let target = tmp.path().join("target");
         fs::write(&target, "{}").unwrap();
         symlink(&target, pi.join("models.json")).unwrap();
-        assert!(configure(&config(), &pi, &omp).is_err());
+        assert!(configure(&config(), &pi).is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "{}");
         let alias = tmp.path().join("alias");
         symlink(&pi, &alias).unwrap();
-        assert!(configure(&config(), &alias, &omp).is_err());
+        assert!(configure(&config(), &alias).is_err());
     }
 }

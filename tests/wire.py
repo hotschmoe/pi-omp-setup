@@ -1,5 +1,5 @@
 """Exercise generated configs with real pinned clients against a loopback mock only.
-PI_BIN and OMP_BIN point to executables; run after cargo build.
+PI_BIN points to the Pi executable; run after cargo build.
 """
 import http.server,json,os,subprocess,tempfile,threading
 from pathlib import Path
@@ -21,15 +21,15 @@ try:
  with tempfile.TemporaryDirectory() as td:
   root=Path(td);(root/'input.json').write_text(json.dumps({'endpoint':'https://example.invalid','api_key':'dummy-key-for-mock'}));(root/'password').write_text('fixture-only-password')
   helper=repo/'target/debug/pi-omp-setup'
-  def run(cmd,**kw):return subprocess.run(list(map(str,cmd)),check=True,capture_output=True,text=True,timeout=60,**kw)
+  def run(cmd,**kw):return subprocess.run(list(map(str,cmd)),check=True,capture_output=True,text=True,timeout=60,stdin=subprocess.DEVNULL,**kw)
   run([helper,'seal','--input',root/'input.json','--output',root/'bundle','--password-file',root/'password'])
-  run([helper,'configure','--bundle',root/'bundle','--password-file',root/'password','--pi-dir',root/'pi','--omp-dir',root/'omp'])
+  run([helper,'configure','--bundle',root/'bundle','--password-file',root/'password','--pi-dir',root/'pi'])
   # Installer correctly requires HTTPS. Redirect only fixture configs to loopback.
-  for path in [root/'pi/models.json', root/'omp/models.yml']:
+  for path in [root/'pi/models.json']:
    path.write_text(path.read_text().replace('https://example.invalid', f'http://127.0.0.1:{server.server_port}'))
-  for client,var in [('pi','PI_BIN'),('omp','OMP_BIN')]:
+  for client,var in [('pi','PI_BIN')]:
    before=len(requests)
-   env={**os.environ,'HOME':str(root),'PI_CODING_AGENT_DIR':str(root/client),'OMP_AGENT_DIR':str(root/client),'PI_OFFLINE':'1'}
+   env={**os.environ,'HOME':str(root),'PI_CODING_AGENT_DIR':str(root/client),'PI_OFFLINE':'1'}
    try:run([os.environ[var],'--mode','json','--provider','hotschmoe-local','--model','hotschmoe-dd','--no-extensions','--no-skills','-p','Reply OK.'],cwd=root,env=env)
    except subprocess.CalledProcessError as e:raise RuntimeError(client+': '+e.stderr[-2500:])
    assert len(requests)>before,client+' sent no requests'
