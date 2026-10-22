@@ -23,8 +23,10 @@ try:
   helper=repo/'target/debug/pi-omp-setup'
   def run(cmd,**kw):return subprocess.run(list(map(str,cmd)),check=True,capture_output=True,text=True,timeout=60,stdin=subprocess.DEVNULL,**kw)
   run([helper,'seal','--input',root/'input.json','--output',root/'bundle','--password-file',root/'password'])
-  run([helper,'configure','--bundle',root/'bundle','--password-file',root/'password','--pi-dir',root/'pi'])
+  run([helper,'configure','--bundle',root/'bundle','--password-file',root/'password','--pi-dir',root/'pi','--omp-dir',root/'omp'])
   # Installer correctly requires HTTPS. Redirect only fixture configs to loopback.
+  models=json.loads((root/'pi/models.json').read_text())
+  assert models['providers']['hotschmoe-local']['models'][0]['input']==['text','image']
   for path in [root/'pi/models.json']:
    path.write_text(path.read_text().replace('https://example.invalid', f'http://127.0.0.1:{server.server_port}'))
   for client,var in [('pi','PI_BIN')]:

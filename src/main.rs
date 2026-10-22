@@ -24,12 +24,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Decrypt a deployment bundle and merge it into Pi user settings.
+    /// Decrypt a deployment bundle and install it into Pi and Oh My Pi settings.
     Configure {
         #[arg(long)]
         bundle: PathBuf,
         #[arg(long)]
         pi_dir: Option<PathBuf>,
+        #[arg(long)]
+        omp_dir: Option<PathBuf>,
         #[arg(long)]
         password_file: Option<PathBuf>,
     },
@@ -128,6 +130,7 @@ fn run() -> Result<()> {
         Commands::Configure {
             bundle,
             pi_dir,
+            omp_dir,
             password_file,
         } => {
             let password = password(password_file.as_deref())?;
@@ -137,8 +140,10 @@ fn run() -> Result<()> {
             let home = dirs::home_dir().context("Cannot determine home directory")?;
             let home = fs::canonicalize(home).context("Cannot resolve home directory")?;
             let pi_dir = pi_dir.unwrap_or_else(|| home.join(".pi/agent"));
-            config::configure(&config, &pi_dir)?;
-            println!("Pi model configuration installed. Credentials were not printed.");
+            let omp_dir = omp_dir.unwrap_or_else(|| home.join(".omp/agent"));
+            config::configure(&config, &pi_dir, &omp_dir)?;
+            println!("Configured {}/{}.", config::PROVIDER, config.model_id);
+            println!("Pi and Oh My Pi model configuration installed. Credentials were not printed.");
         }
         Commands::Check {
             bundle,

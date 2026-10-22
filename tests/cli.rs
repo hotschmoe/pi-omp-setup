@@ -81,8 +81,19 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("Incorrect passphrase"));
     assert!(!root.join("pi").exists());
     fs::create_dir(root.join("pi")).unwrap();
+    fs::create_dir(root.join("omp")).unwrap();
     let settings = br#"{"theme":"existing-theme","unrelated":true}"#;
     fs::write(root.join("pi/settings.json"), settings).unwrap();
+    fs::write(
+        root.join("omp/models.yml"),
+        "providers:\n  hotschmoe:\n    models:\n      - id: retired-model\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("omp/config.yml"),
+        "enabledModels:\n  - retired-model\nmodelRoles:\n  default: retired-model\n",
+    )
+    .unwrap();
     let args = [
         "configure",
         "--bundle",
@@ -91,6 +102,8 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
         "password.txt",
         "--pi-dir",
         "pi",
+        "--omp-dir",
+        "omp",
     ];
     let configured = run(&args, root);
     assert!(
@@ -106,6 +119,24 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
         "hotschmoe-dd"
     );
     assert_eq!(
+        pi["providers"]["hotschmoe-local"]["models"][0]["input"],
+        serde_json::json!(["text", "image"])
+    );
+    let omp_models: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(root.join("omp/models.yml")).unwrap()).unwrap();
+    assert!(omp_models["providers"].get("hotschmoe").is_none());
+    assert_eq!(
+        omp_models["providers"]["hotschmoe-local"]["models"][0]["input"][1],
+        "image"
+    );
+    let omp_config: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(root.join("omp/config.yml")).unwrap()).unwrap();
+    assert_eq!(
+        omp_config["modelRoles"]["vision"],
+        "hotschmoe-local/hotschmoe-dd"
+    );
+    assert_eq!(omp_config["enabledModels"][0], "hotschmoe-dd");
+    assert_eq!(
         fs::read(root.join("pi/settings.json.bak")).unwrap(),
         settings
     );
@@ -117,7 +148,13 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for path in ["bundle.json", "pi/models.json", "pi/settings.json.bak"] {
+        for path in [
+            "bundle.json",
+            "pi/models.json",
+            "pi/settings.json.bak",
+            "omp/models.yml",
+            "omp/config.yml",
+        ] {
             assert_eq!(
                 fs::metadata(root.join(path)).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -128,7 +165,7 @@ fn encrypted_cli_roundtrip_wrong_password_and_preservation() {
     {
         // Ask Windows for the actual DACL instead of matching localized icacls text.
         let checked = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach ($p in @('bundle.json','pi/models.json','pi/settings.json.bak')) { $acl=[IO.File]::GetAccessControl([IO.Path]::GetFullPath($p)); if (-not $acl.AreAccessRulesProtected) { throw 'Inherited ACL remained' }; foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) { if ($rule.IdentityReference.Value -ne $sid) { throw ('Unexpected ACL principal for {0}: {1}, expected {2}' -f $p,$rule.IdentityReference.Value,$sid) } } }"
+            "$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; foreach ($p in @('bundle.json','pi/models.json','pi/settings.json.bak','omp/models.yml','omp/config.yml')) { $acl=[IO.File]::GetAccessControl([IO.Path]::GetFullPath($p)); if (-not $acl.AreAccessRulesProtected) { throw 'Inherited ACL remained' }; foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) { if ($rule.IdentityReference.Value -ne $sid) { throw ('Unexpected ACL principal for {0}: {1}, expected {2}' -f $p,$rule.IdentityReference.Value,$sid) } } }"
         ]).current_dir(root).output().unwrap();
         assert!(
             checked.status.success(),

@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
+    collections::HashSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -145,7 +146,7 @@ fn directory(path: &Path) -> Result<()> {
     private(path, true)
 }
 
-fn read(path: &Path) -> Result<Value> {
+fn read_doc(path: &Path, format: DocFormat) -> Result<Value> {
     check_path(path)?;
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if !metadata.is_file() {
@@ -157,12 +158,19 @@ fn read(path: &Path) -> Result<Value> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
         Err(_) => bail!("Cannot read existing configuration"),
     };
-    let value: Value = serde_json::from_slice(&data)
-        .map_err(|_| anyhow::anyhow!("Existing JSON configuration is malformed"))?;
+    let value: Value = match format {
+        DocFormat::Json => serde_json::from_slice(&data)
+            .map_err(|_| anyhow::anyhow!("Existing JSON configuration is malformed"))?,
+        DocFormat::Yaml => serde_yaml::from_slice(&data)
+            .map_err(|_| anyhow::anyhow!("Existing YAML configuration is malformed"))?,
+    };
     if !value.is_object() {
         bail!("Existing configuration must contain an object");
     }
     Ok(value)
+}
+fn read(path: &Path) -> Result<Value> {
+    read_doc(path, DocFormat::Json)
 }
 
 fn object(value: &mut Value) -> Result<&mut Map<String, Value>> {
@@ -178,62 +186,191 @@ fn child<'a>(value: &'a mut Value, key: &str) -> Result<&'a mut Value> {
     Ok(entry)
 }
 
-fn merge_models(value: &mut Value, config: &ModelConfig, endpoint: &str) -> Result<()> {
-    let provider = child(child(value, "providers")?, PROVIDER)?;
-    let obj = object(provider)?;
-    obj.insert("baseUrl".into(), json!(endpoint));
-    obj.insert("apiKey".into(), json!(config.api_key));
-    obj.insert("api".into(), json!("openai-completions"));
-    let models = obj
-        .entry("models")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .context("Existing provider models must contain an array")?;
-    for model in models.iter() {
-        if !model.is_object() || model.get("id").and_then(Value::as_str).is_none() {
-            bail!("Existing model entry must contain an identifier");
+fn provider_body(config: &ModelConfig, endpoint: &str) -> Value {
+    json!({
+        "baseUrl": endpoint,
+        "apiKey": config.api_key,
+        "api": "openai-completions",
+        "models": [{
+            "id": config.model_id, "name": config.model_id, "api": "openai-completions",
+            "reasoning": true, "input": ["text", "image"], "contextWindow": 200000,
+            "maxTokens": 32768,
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "compat": {
+                "supportsReasoningEffort": true,
+                "supportsDeveloperRole": false,
+                "supportsStore": false,
+                "maxTokensField": "max_tokens",
+                "thinkingFormat": "chat-template",
+                "thinkingTokenBudgetField": "thinking_token_budget",
+                "chatTemplateKwargs": {
+                    "enable_thinking": {"$var": "thinking.enabled"},
+                    "preserve_thinking": true,
+                    "reasoning_effort": {"$var": "thinking.effort"}
+                }
+            }
+        }]
+    })
+}
+
+fn selector(config: &ModelConfig) -> String {
+    format!("{PROVIDER}/{}", config.model_id)
+}
+
+/// Model id plus `provider/id`, so roles and allow-lists can be retargeted.
+fn model_refs(providers: &Value) -> Result<HashSet<String>> {
+    let mut refs = HashSet::new();
+    let Some(map) = providers.as_object() else {
+        if providers.is_null() {
+            return Ok(refs);
+        }
+        bail!("Existing providers field must contain an object");
+    };
+    for (provider, body) in map {
+        if !body.is_object() {
+            bail!("Existing provider entry must contain an object");
+        }
+        match body.get("models") {
+            None => {}
+            Some(Value::Array(models)) => {
+                for model in models {
+                    let Some(id) = model.get("id").and_then(Value::as_str) else {
+                        bail!("Existing model entry must contain an identifier");
+                    };
+                    if id.is_empty() {
+                        bail!("Existing model entry must contain an identifier");
+                    }
+                    refs.insert(id.to_string());
+                    refs.insert(format!("{provider}/{id}"));
+                }
+            }
+            Some(_) => bail!("Existing provider models must contain an array"),
         }
     }
-    let index = models.iter().position(|m| m["id"] == config.model_id);
-    if models.iter().filter(|m| m["id"] == config.model_id).count() > 1 {
-        bail!("Existing provider contains duplicate model identifiers");
+    Ok(refs)
+}
+
+fn split_role(value: &str) -> (&str, Option<&str>) {
+    const LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+    if let Some((model, level)) = value.rsplit_once(':') {
+        if LEVELS.contains(&level) {
+            return (model, Some(level));
+        }
     }
-    let index = index.unwrap_or_else(|| {
-        models.push(json!({}));
-        models.len() - 1
-    });
-    let model = &mut models[index];
-    for (key, value) in json!({
-        "id": config.model_id, "name": config.model_id, "api": "openai-completions",
-        "reasoning": true, "input": ["text"], "contextWindow": 200000, "maxTokens": 32768,
-        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
-    })
-    .as_object()
-    .unwrap()
-    {
-        object(model)?.insert(key.clone(), value.clone());
+    (value, None)
+}
+
+fn names_removed(value: &str, removed: &HashSet<String>) -> bool {
+    let (model, _) = split_role(value);
+    removed.contains(value) || removed.contains(model)
+}
+
+fn is_current_model(text: &str, model_id: &str, selector: &str) -> bool {
+    let (model, _) = split_role(text);
+    model == model_id || text == model_id || model == selector || text == selector
+}
+fn retarget_list(list: &mut Value, removed: &HashSet<String>, model_id: &str, selector: &str) {
+    let Some(items) = list.as_array() else {
+        return;
+    };
+    let mut next = Vec::new();
+    let mut saw_current = false;
+    for item in items {
+        let Some(text) = item.as_str() else {
+            next.push(item.clone());
+            continue;
+        };
+        if names_removed(text, removed) {
+            continue;
+        }
+        if is_current_model(text, model_id, selector) {
+            saw_current = true;
+        }
+        next.push(item.clone());
     }
-    let compat = object(child(model, "compat")?)?;
-    for (key, value) in [
-        ("supportsReasoningEffort", json!(true)),
-        ("supportsDeveloperRole", json!(false)),
-        ("supportsStore", json!(false)),
-        ("maxTokensField", json!("max_tokens")),
-    ] {
-        compat.insert(key.into(), value);
+    if !items.is_empty() && !saw_current {
+        next.push(json!(model_id));
     }
-    compat.insert("thinkingFormat".into(), json!("chat-template"));
-    compat.insert(
-        "thinkingTokenBudgetField".into(),
-        json!("thinking_token_budget"),
-    );
-    compat.insert(
-        "chatTemplateKwargs".into(),
-        json!({
-            "enable_thinking": {"$var": "thinking.enabled"}, "preserve_thinking": true,
-            "reasoning_effort": {"$var": "thinking.effort"}
-        }),
-    );
+    *list = json!(next);
+}
+
+/// Drop every custom provider, then install only the current model.
+/// Returns selectors and ids that were removed so settings can be retargeted.
+fn replace_models(value: &mut Value, config: &ModelConfig, endpoint: &str) -> Result<HashSet<String>> {
+    let root = object(value)?;
+    let removed = model_refs(root.get("providers").unwrap_or(&Value::Null))?;
+    root.insert("providers".into(), json!({ PROVIDER: provider_body(config, endpoint) }));
+    let mut removed = removed;
+    removed.remove(&config.model_id);
+    removed.remove(&selector(config));
+    Ok(removed)
+}
+
+fn assign_roles(settings: &mut Value, config: &ModelConfig, removed: &HashSet<String>) -> Result<()> {
+    let selector = selector(config);
+    let roles = child(settings, "modelRoles")?;
+    object(roles)?.insert("default".into(), json!(&selector));
+    object(roles)?.insert("vision".into(), json!(&selector));
+    let keys: Vec<String> = object(roles)?.keys().cloned().collect();
+    for key in keys {
+        if key == "default" || key == "vision" {
+            continue;
+        }
+        let text = match object(roles)?.get(&key).and_then(Value::as_str) {
+            Some(text) => text.to_string(),
+            None => continue,
+        };
+        if !names_removed(&text, removed) {
+            continue;
+        }
+        let (_, level) = split_role(&text);
+        let updated = match level {
+            Some(level) => format!("{selector}:{level}"),
+            None => selector.clone(),
+        };
+        object(roles)?.insert(key, json!(updated));
+    }
+    Ok(())
+}
+
+fn retarget_settings(settings: &mut Value, config: &ModelConfig, removed: &HashSet<String>) -> Result<()> {
+    assign_roles(settings, config, removed)?;
+    let selector = selector(config);
+    for key in ["enabledModels", "cycleOrder"] {
+        let is_array = object(settings)?.get(key).is_some_and(Value::is_array);
+        if is_array {
+            retarget_list(
+                object(settings)?.get_mut(key).unwrap(),
+                removed,
+                &config.model_id,
+                &selector,
+            );
+        }
+    }
+    // Drop retired ids and never leave the current model disabled.
+    let model_id = config.model_id.clone();
+    let disable = object(settings)?.get("disabledModels").is_some_and(Value::is_array);
+    if disable {
+        let disabled = object(settings)?
+            .get_mut("disabledModels")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        disabled.retain(|item| match item.as_str() {
+            Some(text) => !is_current_model(text, &model_id, &selector) && !names_removed(text, removed),
+            None => true,
+        });
+    }
+    let root = object(settings)?;
+    if !root.contains_key("defaultThinkingLevel") {
+        root.insert("defaultThinkingLevel".into(), json!("medium"));
+    }
+    if !object(child(settings, "thinkingBudgets")?)?.contains_key("medium") {
+        object(child(settings, "thinkingBudgets")?)?.insert("medium".into(), json!(8192));
+    }
+    if !object(child(settings, "compaction")?)?.contains_key("reserveTokens") {
+        object(child(settings, "compaction")?)?.insert("reserveTokens".into(), json!(40000));
+    }
     Ok(())
 }
 
@@ -242,7 +379,24 @@ struct Change {
     old: Option<Vec<u8>>,
     data: Vec<u8>,
 }
-fn stage(path: PathBuf, before: Value, after: Value) -> Result<Option<Change>> {
+#[derive(Clone, Copy)]
+enum DocFormat {
+    Json,
+    Yaml,
+}
+fn serialize(value: &Value, format: DocFormat) -> Result<Vec<u8>> {
+    let mut data = match format {
+        DocFormat::Json => serde_json::to_vec_pretty(value).context("Cannot serialize configuration")?,
+        DocFormat::Yaml => serde_yaml::to_string(value)
+            .context("Cannot serialize configuration")?
+            .into_bytes(),
+    };
+    if !data.ends_with(b"\n") {
+        data.push(b'\n');
+    }
+    Ok(data)
+}
+fn stage(path: PathBuf, before: Value, after: Value, format: DocFormat) -> Result<Option<Change>> {
     check_path(&path)?;
     if before == after && path.exists() {
         return Ok(None);
@@ -252,9 +406,11 @@ fn stage(path: PathBuf, before: Value, after: Value) -> Result<Option<Change>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => bail!("Cannot read existing configuration"),
     };
-    let mut data = serde_json::to_vec_pretty(&after).context("Cannot serialize configuration")?;
-    data.push(b'\n');
-    Ok(Some(Change { path, old, data }))
+    Ok(Some(Change {
+        path,
+        old,
+        data: serialize(&after, format)?,
+    }))
 }
 
 fn atomic(path: &Path, data: &[u8], no_clobber: bool) -> Result<()> {
@@ -277,32 +433,107 @@ fn atomic(path: &Path, data: &[u8], no_clobber: bool) -> Result<()> {
     Ok(())
 }
 
-/// Merge the private model into Pi. Never contacts the endpoint.
+struct Target {
+    path: PathBuf,
+    format: DocFormat,
+}
+fn existing_targets(
+    dir: &Path,
+    names: &[(&str, DocFormat)],
+    default_name: &str,
+    default_format: DocFormat,
+) -> Vec<Target> {
+    let found: Vec<Target> = names
+        .iter()
+        .filter_map(|(name, format)| {
+            let path = dir.join(name);
+            path.exists().then_some(Target { path, format: *format })
+        })
+        .collect();
+    if found.is_empty() {
+        vec![Target {
+            path: dir.join(default_name),
+            format: default_format,
+        }]
+    } else {
+        found
+    }
+}
+fn model_targets(dir: &Path) -> Vec<Target> {
+    existing_targets(
+        dir,
+        &[
+            ("models.yml", DocFormat::Yaml),
+            ("models.yaml", DocFormat::Yaml),
+            ("models.json", DocFormat::Json),
+        ],
+        "models.yml",
+        DocFormat::Yaml,
+    )
+}
+fn omp_setting_targets(dir: &Path) -> Vec<Target> {
+    existing_targets(
+        dir,
+        &[
+            ("config.yml", DocFormat::Yaml),
+            ("config.yaml", DocFormat::Yaml),
+            ("settings.json", DocFormat::Json),
+        ],
+        "config.yml",
+        DocFormat::Yaml,
+    )
+}
+fn stage_models(target: &Target, config: &ModelConfig, endpoint: &str) -> Result<(Option<Change>, HashSet<String>)> {
+    let before = read_doc(&target.path, target.format)?;
+    let mut after = before.clone();
+    let removed = replace_models(&mut after, config, endpoint)?;
+    Ok((stage(target.path.clone(), before, after, target.format)?, removed))
+}
+
+/// Replace custom model providers in Pi and Oh My Pi. Never contacts the endpoint.
 /// All documents are parsed and validated before any configuration is replaced.
-pub fn configure(config: &ModelConfig, pi_dir: &Path) -> Result<()> {
+pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path) -> Result<()> {
     let endpoint = base_url(config)?;
     check_path(pi_dir)?;
+    check_path(omp_dir)?;
     let mut changes = Vec::new();
-    for (path, models) in [
-        (pi_dir.join("models.json"), true),
-        (pi_dir.join("settings.json"), false),
-    ] {
-        let before = read(&path)?;
-        let mut after = before.clone();
-        if models {
-            merge_models(&mut after, config, &endpoint)?;
-        } else {
-            object(&mut after)?.insert("defaultProvider".into(), json!(PROVIDER));
-            object(&mut after)?.insert("defaultModel".into(), json!(config.model_id));
-            object(&mut after)?.insert("defaultThinkingLevel".into(), json!("medium"));
-            object(child(&mut after, "thinkingBudgets")?)?.insert("medium".into(), json!(8192));
-            object(child(&mut after, "compaction")?)?.insert("reserveTokens".into(), json!(40000));
+    let mut removed = HashSet::new();
+    for target in [
+        Target {
+            path: pi_dir.join("models.json"),
+            format: DocFormat::Json,
+        },
+    ]
+    .into_iter()
+    .chain(model_targets(omp_dir))
+    {
+        let (change, refs) = stage_models(&target, config, &endpoint)?;
+        removed.extend(refs);
+        if let Some(change) = change {
+            changes.push(change);
         }
-        if let Some(change) = stage(path, before, after)? {
+    }
+    let pi_settings = pi_dir.join("settings.json");
+    let before = read(&pi_settings)?;
+    let mut after = before.clone();
+    object(&mut after)?.insert("defaultProvider".into(), json!(PROVIDER));
+    object(&mut after)?.insert("defaultModel".into(), json!(config.model_id));
+    object(&mut after)?.insert("defaultThinkingLevel".into(), json!("medium"));
+    object(child(&mut after, "thinkingBudgets")?)?.insert("medium".into(), json!(8192));
+    object(child(&mut after, "compaction")?)?.insert("reserveTokens".into(), json!(40000));
+    if let Some(change) = stage(pi_settings, before, after, DocFormat::Json)? {
+        changes.push(change);
+    }
+    for target in omp_setting_targets(omp_dir) {
+        let before = read_doc(&target.path, target.format)?;
+        let mut after = before.clone();
+        retarget_settings(&mut after, config, &removed)?;
+        if let Some(change) = stage(target.path, before, after, target.format)? {
             changes.push(change);
         }
     }
     directory(pi_dir)?;
+    directory(omp_dir)?;
     for change in changes {
         check_path(&change.path)?;
         if let Some(old) = &change.old {
@@ -331,8 +562,13 @@ pub fn configure(config: &ModelConfig, pi_dir: &Path) -> Result<()> {
         atomic(&change.path, &change.data, false)?;
     }
     // Also harden files when content was already correct.
-    for path in [pi_dir.join("models.json"), pi_dir.join("settings.json")] {
-        private(&path, false)?;
+    let mut harden = vec![pi_dir.join("models.json"), pi_dir.join("settings.json")];
+    harden.extend(model_targets(omp_dir).into_iter().map(|target| target.path));
+    harden.extend(omp_setting_targets(omp_dir).into_iter().map(|target| target.path));
+    for path in harden {
+        if path.is_file() {
+            private(&path, false)?;
+        }
     }
     Ok(())
 }
@@ -355,7 +591,8 @@ mod tests {
     fn fresh_defaults_and_idempotence() {
         let tmp = scratch();
         let pi = tmp.path().join("pi");
-        configure(&config(), &pi).unwrap();
+        let omp = tmp.path().join("omp");
+        configure(&config(), &pi, &omp).unwrap();
         assert_eq!(
             read(&pi.join("settings.json")).unwrap()["defaultModel"],
             DEFAULT_MODEL
@@ -369,6 +606,22 @@ mod tests {
             pm["providers"][PROVIDER]["models"][0]["contextWindow"],
             200000
         );
+        assert_eq!(
+            pm["providers"][PROVIDER]["models"][0]["input"],
+            json!(["text", "image"])
+        );
+        assert_eq!(pm["providers"].as_object().unwrap().len(), 1);
+        let omp_models = read_doc(&omp.join("models.yml"), DocFormat::Yaml).unwrap();
+        assert_eq!(
+            omp_models["providers"][PROVIDER]["models"][0]["input"],
+            json!(["text", "image"])
+        );
+        let omp_config = read_doc(&omp.join("config.yml"), DocFormat::Yaml).unwrap();
+        assert_eq!(
+            omp_config["modelRoles"]["vision"],
+            format!("{PROVIDER}/{DEFAULT_MODEL}")
+        );
+        assert_eq!(omp_config["defaultThinkingLevel"], "medium");
         let pc = &pm["providers"][PROVIDER]["models"][0]["compat"];
         assert_eq!(pc["thinkingTokenBudgetField"], "thinking_token_budget");
         assert_eq!(
@@ -379,8 +632,9 @@ mod tests {
         assert_eq!(settings["defaultThinkingLevel"], "medium");
         assert_eq!(settings["thinkingBudgets"]["medium"], 8192);
         assert_eq!(settings["compaction"]["reserveTokens"], 40000);
-        configure(&config(), &pi).unwrap();
+        configure(&config(), &pi, &omp).unwrap();
         assert!(!pi.join("models.json.bak").exists());
+        assert!(!omp.join("models.yml.bak").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -408,24 +662,24 @@ mod tests {
         fs::write(pi.join("auth.json"), "opaque unchanged bytes").unwrap();
         fs::write(
             pi.join("models.json"),
-            r#"{"providers":{"other":{"apiKey":"keep","models":[]}}}"#,
+            r#"{"providers":{"other":{"apiKey":"keep","models":[{"id":"retired"}]}}}"#,
         )
         .unwrap();
-        configure(&config(), &pi).unwrap();
+        let omp = tmp.path().join("omp");
+        configure(&config(), &pi, &omp).unwrap();
         assert_eq!(fs::read(pi.join("settings.json.bak")).unwrap(), original);
         assert_eq!(read(&pi.join("settings.json")).unwrap()["custom"]["a"], 1);
-        assert_eq!(
-            read(&pi.join("models.json")).unwrap()["providers"]["other"]["apiKey"],
-            "keep"
-        );
+        let models = read(&pi.join("models.json")).unwrap();
+        assert!(models["providers"].get("other").is_none());
+        assert_eq!(models["providers"][PROVIDER]["models"][0]["id"], DEFAULT_MODEL);
         assert_eq!(
             fs::read_to_string(pi.join("auth.json")).unwrap(),
             "opaque unchanged bytes"
         );
         let mut updated = config();
         updated.api_key = "changed-placeholder".into();
-        configure(&updated, &pi).unwrap();
-        configure(&config(), &pi).unwrap();
+        configure(&updated, &pi, &omp).unwrap();
+        configure(&config(), &pi, &omp).unwrap();
         assert!(pi.join("models.json.bak.1").exists());
     }
     #[test]
@@ -441,7 +695,7 @@ mod tests {
             let pi = tmp.path().join("pi");
             directory(&pi).unwrap();
             fs::write(pi.join("models.json"), bad).unwrap();
-            assert!(configure(&config(), &pi).is_err());
+            assert!(configure(&config(), &pi, &tmp.path().join("omp")).is_err());
             assert_eq!(fs::read_to_string(pi.join("models.json")).unwrap(), bad);
         }
     }
@@ -452,7 +706,9 @@ mod tests {
         directory(&pi).unwrap();
         fs::write(pi.join("models.json"), "{}").unwrap();
         fs::write(pi.join("settings.json"), "{\"compaction\":[]}").unwrap();
-        assert!(configure(&config(), &pi).is_err());
+        let omp = tmp.path().join("omp");
+        assert!(configure(&config(), &pi, &omp).is_err());
+        assert!(!omp.exists());
         assert_eq!(fs::read_to_string(pi.join("models.json")).unwrap(), "{}");
         assert_eq!(
             fs::read_to_string(pi.join("settings.json")).unwrap(),
@@ -461,27 +717,44 @@ mod tests {
         assert!(!pi.join("models.json.bak").exists());
     }
     #[test]
-    fn preserves_other_models_and_compat_options() {
-        let mut value = json!({"providers": {PROVIDER: {
-            "headers": {"X-Custom": "preserved"},
-            "models": [
-                {"id": "other", "name": "Existing"},
-                {"id": DEFAULT_MODEL, "compat": {"supportsUsageInStreaming": false}, "headers": {"X-Model": "preserved"}}
-            ]
-        }}});
-        merge_models(&mut value, &config(), "https://example.invalid/v1").unwrap();
-        let provider = &value["providers"][PROVIDER];
-        assert_eq!(provider["headers"]["X-Custom"], "preserved");
-        assert_eq!(provider["models"][0]["name"], "Existing");
+    fn removes_old_models_and_points_vision_at_the_current_model() {
+        let tmp = scratch();
+        let pi = tmp.path().join("pi");
+        let omp = tmp.path().join("omp");
+        directory(&pi).unwrap();
+        directory(&omp).unwrap();
+        fs::write(
+            omp.join("models.yml"),
+            "providers:\n  hotschmoe:\n    models:\n      - id: retired-model\n        input: [text]\n  hotschmoe-local:\n    models:\n      - id: hotschmoe-dd\n        input: [text]\n",
+        )
+        .unwrap();
+        fs::write(
+            omp.join("config.yml"),
+            "display: kept\nenabledModels:\n  - retired-model\ndisabledModels:\n  - hotschmoe-dd\nmodelRoles:\n  default: hotschmoe-local/retired-model\n  plan: retired-model:high\n  slow: anthropic/claude-sonnet\n",
+        )
+        .unwrap();
+        configure(&config(), &pi, &omp).unwrap();
+        let models = read_doc(&omp.join("models.yml"), DocFormat::Yaml).unwrap();
+        assert!(models["providers"].get("hotschmoe").is_none());
         assert_eq!(
-            provider["models"][1]["compat"]["supportsUsageInStreaming"],
-            false
+            models["providers"][PROVIDER]["models"][0]["input"],
+            json!(["text", "image"])
+        );
+        let settings = read_doc(&omp.join("config.yml"), DocFormat::Yaml).unwrap();
+        assert_eq!(settings["display"], "kept");
+        assert_eq!(settings["enabledModels"], json!(["hotschmoe-dd"]));
+        assert_eq!(settings["disabledModels"], json!([]));
+        assert_eq!(
+            settings["modelRoles"]["vision"],
+            "hotschmoe-local/hotschmoe-dd"
         );
         assert_eq!(
-            provider["models"][1]["compat"]["supportsReasoningEffort"],
-            true
+            settings["modelRoles"]["plan"],
+            "hotschmoe-local/hotschmoe-dd:high"
         );
-        assert_eq!(provider["models"][1]["headers"]["X-Model"], "preserved");
+        assert_eq!(settings["modelRoles"]["slow"], "anthropic/claude-sonnet");
+        configure(&config(), &pi, &omp).unwrap();
+        assert!(!omp.join("config.yml.bak.1").exists());
     }
     #[test]
     fn rejects_secret_commands_and_bad_urls_without_echoing() {
@@ -515,10 +788,10 @@ mod tests {
         let target = tmp.path().join("target");
         fs::write(&target, "{}").unwrap();
         symlink(&target, pi.join("models.json")).unwrap();
-        assert!(configure(&config(), &pi).is_err());
+        assert!(configure(&config(), &pi, &tmp.path().join("omp")).is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "{}");
         let alias = tmp.path().join("alias");
         symlink(&pi, &alias).unwrap();
-        assert!(configure(&config(), &alias).is_err());
+        assert!(configure(&config(), &alias, &tmp.path().join("omp")).is_err());
     }
 }
