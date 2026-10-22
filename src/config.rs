@@ -146,6 +146,143 @@ fn directory(path: &Path) -> Result<()> {
     private(path, true)
 }
 
+fn decode_utf16(data: &[u8], little_endian: bool) -> Result<String> {
+    if data.len() % 2 != 0 {
+        bail!("Existing configuration is not valid UTF-16");
+    }
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect();
+    String::from_utf16(&units).context("Existing configuration is not valid UTF-16")
+}
+fn decode_config_text(data: &[u8]) -> Result<String> {
+    if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(data[3..].to_vec()).context("Existing configuration is not UTF-8");
+    }
+    if data.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16(&data[2..], true);
+    }
+    if data.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16(&data[2..], false);
+    }
+    // PowerShell 5.1's default text encoding is UTF-16 LE and sometimes omits a BOM.
+    let utf16_le = data.len() >= 4
+        && data.len() % 2 == 0
+        && data[1] == 0
+        && data[0].is_ascii()
+        && data.iter().take(64).any(|byte| *byte == 0);
+    if utf16_le {
+        return decode_utf16(data, true);
+    }
+    String::from_utf8(data.to_vec()).context("Existing configuration is not UTF-8")
+}
+/// Pi accepts a leading BOM. Editors and Windows PowerShell also write comments,
+/// trailing commas, and UTF-16. Strings are copied unchanged.
+fn relax_json(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut without_comments = Vec::with_capacity(chars.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if current == '"' {
+            without_comments.push(current);
+            index += 1;
+            while index < chars.len() {
+                let quoted = chars[index];
+                without_comments.push(quoted);
+                index += 1;
+                if quoted == '\\' && index < chars.len() {
+                    without_comments.push(chars[index]);
+                    index += 1;
+                    continue;
+                }
+                if quoted == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if current == '/' && index + 1 < chars.len() && matches!(chars[index + 1], '/' | '*') {
+            if chars[index + 1] == '/' {
+                index += 2;
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            } else {
+                index += 2;
+                while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                    index += 1;
+                }
+                if index + 1 < chars.len() {
+                    index += 2;
+                }
+            }
+            without_comments.push(' ');
+            continue;
+        }
+        without_comments.push(current);
+        index += 1;
+    }
+    let mut cleaned = String::new();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < without_comments.len() {
+        let current = without_comments[index];
+        if in_string {
+            cleaned.push(current);
+            if escaped {
+                escaped = false;
+            } else if current == '\\' {
+                escaped = true;
+            } else if current == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if current == '"' {
+            in_string = true;
+            cleaned.push(current);
+            index += 1;
+            continue;
+        }
+        if current == ',' {
+            let mut ahead = index + 1;
+            while ahead < without_comments.len() && without_comments[ahead].is_whitespace() {
+                ahead += 1;
+            }
+            if ahead < without_comments.len()
+                && matches!(without_comments[ahead], '}' | ']')
+            {
+                index += 1;
+                continue;
+            }
+        }
+        cleaned.push(current);
+        index += 1;
+    }
+    cleaned
+}
+fn parse_json_document(text: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        return Some(value);
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(&relax_json(text)) {
+        return Some(value);
+    }
+    // Unquoted keys are invalid JSON and valid YAML objects.
+    serde_yaml::from_str::<Value>(text)
+        .ok()
+        .filter(Value::is_object)
+}
 fn read_doc(path: &Path, format: DocFormat) -> Result<Value> {
     check_path(path)?;
     if let Ok(metadata) = fs::symlink_metadata(path) {
@@ -158,14 +295,29 @@ fn read_doc(path: &Path, format: DocFormat) -> Result<Value> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
         Err(_) => bail!("Cannot read existing configuration"),
     };
-    let value: Value = match format {
-        DocFormat::Json => serde_json::from_slice(&data)
-            .map_err(|_| anyhow::anyhow!("Existing JSON configuration is malformed"))?,
-        DocFormat::Yaml => serde_yaml::from_slice(&data)
-            .map_err(|_| anyhow::anyhow!("Existing YAML configuration is malformed"))?,
+    let text = decode_config_text(&data)?;
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    let value = match format {
+        DocFormat::Json => parse_json_document(&text).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Existing JSON configuration is malformed: {}",
+                path.display()
+            )
+        })?,
+        DocFormat::Yaml => serde_yaml::from_str(&text).map_err(|_| {
+            anyhow::anyhow!(
+                "Existing YAML configuration is malformed: {}",
+                path.display()
+            )
+        })?,
     };
     if !value.is_object() {
-        bail!("Existing configuration must contain an object");
+        bail!(
+            "Existing configuration must contain an object: {}",
+            path.display()
+        );
     }
     Ok(value)
 }
@@ -681,6 +833,32 @@ mod tests {
         configure(&updated, &pi, &omp).unwrap();
         configure(&config(), &pi, &omp).unwrap();
         assert!(pi.join("models.json.bak.1").exists());
+    }
+    #[test]
+    fn accepts_windows_json_text() {
+        let tmp = scratch();
+        let pi = tmp.path().join("pi");
+        directory(&pi).unwrap();
+        let mut models = vec![0xEF, 0xBB, 0xBF];
+        models.extend_from_slice(
+            br#"{
+            // editor note
+            "theme": "keep/this//slash",
+            "providers": { "other": { "models": [ { "id": "retired", }, ], }, },
+        }"#,
+        );
+        fs::write(pi.join("models.json"), models).unwrap();
+        let settings = "{\r\n  \"custom\": { \"note\": \"line//inside\" },\r\n}\r\n";
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in settings.encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        fs::write(pi.join("settings.json"), utf16).unwrap();
+        configure(&config(), &pi, &tmp.path().join("omp")).unwrap();
+        let written = read(&pi.join("models.json")).unwrap();
+        assert!(written["providers"].get("other").is_none());
+        assert_eq!(written["theme"], "keep/this//slash");
+        assert_eq!(read(&pi.join("settings.json")).unwrap()["custom"]["note"], "line//inside");
     }
     #[test]
     fn rejects_bad_shape_before_writing() {
