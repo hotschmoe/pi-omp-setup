@@ -13,7 +13,7 @@ param(
     [switch]$LoadFunctionsOnly
 )
 $ErrorActionPreference = 'Stop'
-$SetupVersion = 'v0.3.0'
+$SetupVersion = 'v0.3.1'
 $PiRelease = 'https://github.com/earendil-works/pi/releases/latest/download'
 $OmpRelease = 'https://github.com/can1357/oh-my-pi/releases/latest/download'
 function Get-SetupArchitecture {
@@ -40,13 +40,16 @@ function Add-UserPath([string]$Directory) {
     if (@($env:Path -split ';') -notcontains $Directory) { $env:Path = "$Directory;$env:Path" }
 }
 function Assert-Exit([string]$Name) { if ($LASTEXITCODE -ne 0) { throw "$Name exited with code $LASTEXITCODE" } }
-function Install-Bash([string]$Arch, [string]$Scratch) {
+function Find-Bash {
     $candidates = @((Join-Path $DataDir 'git\bin\bash.exe'))
     if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles 'Git\bin\bash.exe') }
     if (${env:ProgramFiles(x86)}) { $candidates += (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe') }
     $git = Get-Command git.exe -ErrorAction SilentlyContinue
     if ($git) { $candidates += (Join-Path (Split-Path (Split-Path $git.Source)) 'bin\bash.exe') }
-    $bashPath = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+    return $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+}
+function Install-Bash([string]$Arch, [string]$Scratch) {
+    $bashPath = Find-Bash
     if (-not $bashPath) {
         Write-Host 'Installing portable Git for Windows to supply Bash required by Pi.'
         $flavor = if ($Arch -eq 'arm64') { 'arm64' } else { '64-bit' }
@@ -61,8 +64,10 @@ function Install-Bash([string]$Arch, [string]$Scratch) {
         if (-not (Test-Path -LiteralPath $bashPath)) { throw 'Portable Git did not provide Bash' }
         Add-UserPath (Join-Path $gitDir 'cmd')
     }
-    # Pi resolves bash.exe from PATH (there is no PI_BASH_PATH setting).
+    # The WSL stub in System32 precedes user PATH entries, so the path is
+    # also written to each client's shellPath setting by the configure step.
     Add-UserPath (Split-Path $bashPath)
+    return $bashPath
 }
 function Remove-ManagedFile([string]$Path, [string]$Marker) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
@@ -156,7 +161,7 @@ function Invoke-ModelProbe([string]$Name, [string]$FilePath, [string]$Arguments)
         $stderr = $stderrTask.Result
         if ($process.ExitCode -ne 0) { throw "$Name probe failed: $stderr" }
         if ([string]::IsNullOrWhiteSpace($stdout)) { throw "$Name returned an empty response: $stderr" }
-        Write-Host "$Name responded."
+        Write-Host ("$Name responded: " + $stdout.Trim())
     } finally {
         Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -186,7 +191,7 @@ function Invoke-Setup {
     try {
         if (-not $ConfigureOnly) {
             if (-not $Update) { Remove-LegacyInstall $OmpDir }
-            Install-Bash $arch $scratch
+            $null = Install-Bash $arch $scratch
             Install-PiBinary $arch $scratch
             Install-OmpBinary $arch $scratch
             Install-Updater
@@ -204,13 +209,18 @@ function Invoke-Setup {
             Assert-Checksum (Join-Path $scratch 'config.enc.json') (Join-Path $scratch 'setup.sha256') 'config.enc.json'
             $helper = Join-Path $BinDir 'pi-omp-setup.exe'
             Copy-Item -LiteralPath (Join-Path $scratch $helperAsset) -Destination $helper -Force
-            & $helper configure --bundle (Join-Path $scratch 'config.enc.json') --pi-dir $PiDir --omp-dir $OmpDir
+            $configureArgs = @('configure', '--bundle', (Join-Path $scratch 'config.enc.json'), '--pi-dir', $PiDir, '--omp-dir', $OmpDir)
+            $bash = Find-Bash
+            if ($bash) { $configureArgs += @('--shell-path', $bash) }
+            & $helper @configureArgs
             Assert-Exit 'Private configuration'
             Add-UserPath $BinDir
         }
-        if (-not $SkipProbe) { Invoke-ConfiguredProbe }
+        $probeError = $null
+        if (-not $SkipProbe) { try { Invoke-ConfiguredProbe } catch { $probeError = $_.Exception.Message } }
         if ($Update) { Write-Host 'Updated. pi and omp are the latest published release binaries.' }
         else { Write-Host 'Installed. Open a new terminal and run pi or omp. Update both later with: pi-omp-update' }
+        if ($probeError) { Write-Warning "Installed, but the model probe failed. Rerun with -ConfigureOnly after fixing:`r`n$probeError" }
     } finally { Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
 }
 if (-not $LoadFunctionsOnly) { Invoke-Setup }

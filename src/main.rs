@@ -32,6 +32,9 @@ enum Commands {
         pi_dir: Option<PathBuf>,
         #[arg(long)]
         omp_dir: Option<PathBuf>,
+        /// Bash executable for Pi and Oh My Pi's shell tool (written as shellPath).
+        #[arg(long)]
+        shell_path: Option<PathBuf>,
         #[arg(long)]
         password_file: Option<PathBuf>,
     },
@@ -131,6 +134,7 @@ fn run() -> Result<()> {
             bundle,
             pi_dir,
             omp_dir,
+            shell_path,
             password_file,
         } => {
             let password = password(password_file.as_deref())?;
@@ -141,7 +145,7 @@ fn run() -> Result<()> {
             let home = fs::canonicalize(home).context("Cannot resolve home directory")?;
             let pi_dir = pi_dir.unwrap_or_else(|| home.join(".pi/agent"));
             let omp_dir = omp_dir.unwrap_or_else(|| home.join(".omp/agent"));
-            config::configure(&config, &pi_dir, &omp_dir)?;
+            config::configure(&config, &pi_dir, &omp_dir, shell_path.as_deref())?;
             println!("Configured {}/{}.", config::PROVIDER, config.model_id);
             println!("Pi and Oh My Pi model configuration installed. Credentials were not printed.");
         }

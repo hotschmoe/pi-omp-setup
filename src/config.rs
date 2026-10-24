@@ -338,8 +338,8 @@ fn child<'a>(value: &'a mut Value, key: &str) -> Result<&'a mut Value> {
     Ok(entry)
 }
 
-fn provider_body(config: &ModelConfig, endpoint: &str) -> Value {
-    json!({
+fn provider_body(config: &ModelConfig, endpoint: &str, omp: bool) -> Value {
+    let mut body = json!({
         "baseUrl": endpoint,
         "apiKey": config.api_key,
         "api": "openai-completions",
@@ -362,7 +362,15 @@ fn provider_body(config: &ModelConfig, endpoint: &str) -> Value {
                 }
             }
         }]
-    })
+    });
+    if omp {
+        // Oh My Pi has no configurable "chat-template" format; "qwen-chat-template"
+        // sends enable_thinking and preserve_thinking itself.
+        let compat = &mut body["models"][0]["compat"];
+        compat["thinkingFormat"] = json!("qwen-chat-template");
+        compat.as_object_mut().unwrap().remove("chatTemplateKwargs");
+    }
+    body
 }
 
 fn selector(config: &ModelConfig) -> String {
@@ -448,10 +456,10 @@ fn retarget_list(list: &mut Value, removed: &HashSet<String>, model_id: &str, se
 
 /// Drop every custom provider, then install only the current model.
 /// Returns selectors and ids that were removed so settings can be retargeted.
-fn replace_models(value: &mut Value, config: &ModelConfig, endpoint: &str) -> Result<HashSet<String>> {
+fn replace_models(value: &mut Value, config: &ModelConfig, endpoint: &str, omp: bool) -> Result<HashSet<String>> {
     let root = object(value)?;
     let removed = model_refs(root.get("providers").unwrap_or(&Value::Null))?;
-    root.insert("providers".into(), json!({ PROVIDER: provider_body(config, endpoint) }));
+    root.insert("providers".into(), json!({ PROVIDER: provider_body(config, endpoint, omp) }));
     let mut removed = removed;
     removed.remove(&config.model_id);
     removed.remove(&selector(config));
@@ -635,31 +643,29 @@ fn omp_setting_targets(dir: &Path) -> Vec<Target> {
         DocFormat::Yaml,
     )
 }
-fn stage_models(target: &Target, config: &ModelConfig, endpoint: &str) -> Result<(Option<Change>, HashSet<String>)> {
+fn stage_models(target: &Target, config: &ModelConfig, endpoint: &str, omp: bool) -> Result<(Option<Change>, HashSet<String>)> {
     let before = read_doc(&target.path, target.format)?;
     let mut after = before.clone();
-    let removed = replace_models(&mut after, config, endpoint)?;
+    let removed = replace_models(&mut after, config, endpoint, omp)?;
     Ok((stage(target.path.clone(), before, after, target.format)?, removed))
 }
 
 /// Replace custom model providers in Pi and Oh My Pi. Never contacts the endpoint.
 /// All documents are parsed and validated before any configuration is replaced.
-pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path) -> Result<()> {
+pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path, shell_path: Option<&Path>) -> Result<()> {
     let endpoint = base_url(config)?;
     check_path(pi_dir)?;
     check_path(omp_dir)?;
     let mut changes = Vec::new();
     let mut removed = HashSet::new();
-    for target in [
-        Target {
-            path: pi_dir.join("models.json"),
-            format: DocFormat::Json,
-        },
-    ]
-    .into_iter()
-    .chain(model_targets(omp_dir))
-    {
-        let (change, refs) = stage_models(&target, config, &endpoint)?;
+    let pi_target = Target {
+        path: pi_dir.join("models.json"),
+        format: DocFormat::Json,
+    };
+    let targets = std::iter::once((pi_target, false))
+        .chain(model_targets(omp_dir).into_iter().map(|target| (target, true)));
+    for (target, omp) in targets {
+        let (change, refs) = stage_models(&target, config, &endpoint, omp)?;
         removed.extend(refs);
         if let Some(change) = change {
             changes.push(change);
@@ -673,6 +679,13 @@ pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path) -> Result<
     object(&mut after)?.insert("defaultThinkingLevel".into(), json!("medium"));
     object(child(&mut after, "thinkingBudgets")?)?.insert("medium".into(), json!(8192));
     object(child(&mut after, "compaction")?)?.insert("reserveTokens".into(), json!(40000));
+    if let Some(shell) = shell_path {
+        object(&mut after)?.insert("shellPath".into(), json!(shell.to_string_lossy()));
+    }
+    let selector = selector(config);
+    if let Some(list) = object(&mut after)?.get_mut("enabledModels") {
+        retarget_list(list, &removed, &config.model_id, &selector);
+    }
     if let Some(change) = stage(pi_settings, before, after, DocFormat::Json)? {
         changes.push(change);
     }
@@ -680,6 +693,9 @@ pub fn configure(config: &ModelConfig, pi_dir: &Path, omp_dir: &Path) -> Result<
         let before = read_doc(&target.path, target.format)?;
         let mut after = before.clone();
         retarget_settings(&mut after, config, &removed)?;
+        if let Some(shell) = shell_path {
+            object(&mut after)?.insert("shellPath".into(), json!(shell.to_string_lossy()));
+        }
         if let Some(change) = stage(target.path, before, after, target.format)? {
             changes.push(change);
         }
@@ -744,7 +760,14 @@ mod tests {
         let tmp = scratch();
         let pi = tmp.path().join("pi");
         let omp = tmp.path().join("omp");
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&config(), &pi, &omp, Some(Path::new("/opt/git/bash"))).unwrap();
+        assert_eq!(read(&pi.join("settings.json")).unwrap()["shellPath"], "/opt/git/bash");
+        let omp_cfg = read_doc(&omp.join("config.yml"), DocFormat::Yaml).unwrap();
+        assert_eq!(omp_cfg["shellPath"], "/opt/git/bash");
+        let om = read_doc(&omp.join("models.yml"), DocFormat::Yaml).unwrap();
+        assert_eq!(om["providers"][PROVIDER]["models"][0]["compat"]["thinkingFormat"], "qwen-chat-template");
+        let pm = read(&pi.join("models.json")).unwrap();
+        assert_eq!(pm["providers"][PROVIDER]["models"][0]["compat"]["thinkingFormat"], "chat-template");
         assert_eq!(
             read(&pi.join("settings.json")).unwrap()["defaultModel"],
             DEFAULT_MODEL
@@ -784,7 +807,7 @@ mod tests {
         assert_eq!(settings["defaultThinkingLevel"], "medium");
         assert_eq!(settings["thinkingBudgets"]["medium"], 8192);
         assert_eq!(settings["compaction"]["reserveTokens"], 40000);
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&config(), &pi, &omp, None).unwrap();
         assert!(!pi.join("models.json.bak").exists());
         assert!(!omp.join("models.yml.bak").exists());
         #[cfg(unix)]
@@ -818,7 +841,7 @@ mod tests {
         )
         .unwrap();
         let omp = tmp.path().join("omp");
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&config(), &pi, &omp, None).unwrap();
         assert_eq!(fs::read(pi.join("settings.json.bak")).unwrap(), original);
         assert_eq!(read(&pi.join("settings.json")).unwrap()["custom"]["a"], 1);
         let models = read(&pi.join("models.json")).unwrap();
@@ -830,8 +853,8 @@ mod tests {
         );
         let mut updated = config();
         updated.api_key = "changed-placeholder".into();
-        configure(&updated, &pi, &omp).unwrap();
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&updated, &pi, &omp, None).unwrap();
+        configure(&config(), &pi, &omp, None).unwrap();
         assert!(pi.join("models.json.bak.1").exists());
     }
     #[test]
@@ -854,7 +877,7 @@ mod tests {
             utf16.extend(unit.to_le_bytes());
         }
         fs::write(pi.join("settings.json"), utf16).unwrap();
-        configure(&config(), &pi, &tmp.path().join("omp")).unwrap();
+        configure(&config(), &pi, &tmp.path().join("omp"), None).unwrap();
         let written = read(&pi.join("models.json")).unwrap();
         assert!(written["providers"].get("other").is_none());
         assert_eq!(written["theme"], "keep/this//slash");
@@ -873,7 +896,7 @@ mod tests {
             let pi = tmp.path().join("pi");
             directory(&pi).unwrap();
             fs::write(pi.join("models.json"), bad).unwrap();
-            assert!(configure(&config(), &pi, &tmp.path().join("omp")).is_err());
+            assert!(configure(&config(), &pi, &tmp.path().join("omp"), None).is_err());
             assert_eq!(fs::read_to_string(pi.join("models.json")).unwrap(), bad);
         }
     }
@@ -885,7 +908,7 @@ mod tests {
         fs::write(pi.join("models.json"), "{}").unwrap();
         fs::write(pi.join("settings.json"), "{\"compaction\":[]}").unwrap();
         let omp = tmp.path().join("omp");
-        assert!(configure(&config(), &pi, &omp).is_err());
+        assert!(configure(&config(), &pi, &omp, None).is_err());
         assert!(!omp.exists());
         assert_eq!(fs::read_to_string(pi.join("models.json")).unwrap(), "{}");
         assert_eq!(
@@ -911,7 +934,7 @@ mod tests {
             "display: kept\nenabledModels:\n  - retired-model\ndisabledModels:\n  - hotschmoe-dd\nmodelRoles:\n  default: hotschmoe-local/retired-model\n  plan: retired-model:high\n  slow: anthropic/claude-sonnet\n",
         )
         .unwrap();
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&config(), &pi, &omp, None).unwrap();
         let models = read_doc(&omp.join("models.yml"), DocFormat::Yaml).unwrap();
         assert!(models["providers"].get("hotschmoe").is_none());
         assert_eq!(
@@ -931,7 +954,7 @@ mod tests {
             "hotschmoe-local/hotschmoe-dd:high"
         );
         assert_eq!(settings["modelRoles"]["slow"], "anthropic/claude-sonnet");
-        configure(&config(), &pi, &omp).unwrap();
+        configure(&config(), &pi, &omp, None).unwrap();
         assert!(!omp.join("config.yml.bak.1").exists());
     }
     #[test]
@@ -966,10 +989,10 @@ mod tests {
         let target = tmp.path().join("target");
         fs::write(&target, "{}").unwrap();
         symlink(&target, pi.join("models.json")).unwrap();
-        assert!(configure(&config(), &pi, &tmp.path().join("omp")).is_err());
+        assert!(configure(&config(), &pi, &tmp.path().join("omp"), None).is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "{}");
         let alias = tmp.path().join("alias");
         symlink(&pi, &alias).unwrap();
-        assert!(configure(&config(), &alias, &tmp.path().join("omp")).is_err());
+        assert!(configure(&config(), &alias, &tmp.path().join("omp"), None).is_err());
     }
 }

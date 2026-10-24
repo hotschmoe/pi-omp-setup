@@ -11,13 +11,13 @@ You need the **six randomly chosen words** supplied privately by the maintainer.
 Linux or macOS, from an interactive terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.3.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.3.1/install.sh | bash
 ```
 
 Windows, from PowerShell 5.1 or newer:
 
 ```powershell
-& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.3.0/install.ps1).Content))
+& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.3.1/install.ps1).Content))
 ```
 
 Enter the private passphrase when asked. The installer then sends each program the prompt `Reply with the single word OK.` and waits for a non-empty answer. Open a new terminal and run `pi` or `omp`.
@@ -38,7 +38,7 @@ Linux helper builds target Ubuntu 22.04's glibc baseline or newer. Alpine/musl L
 
 | Component | Version |
 | --- | --- |
-| Setup helper and encrypted bundle | `v0.3.0` |
+| Setup helper and encrypted bundle | `v0.3.1` |
 | Pi | latest GitHub release, checksum verified |
 | Oh My Pi | latest GitHub release, checksum verified |
 | Portable Git for Windows, when needed | `v2.55.0.windows.5` |
@@ -65,12 +65,12 @@ The client files contain the decrypted credentials so Pi can connect normally. T
 Download the installer first when passing options:
 
 ```bash
-curl -fsSLo install.sh https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.3.0/install.sh
+curl -fsSLo install.sh https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.3.1/install.sh
 bash install.sh --configure-only
 ```
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.3.0/install.ps1 -OutFile install.ps1
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/hotschmoe/pi-omp-setup/v0.3.1/install.ps1 -OutFile install.ps1
 & .\install.ps1 -ConfigureOnly
 ```
 

@@ -3,7 +3,7 @@
 # No Node.js, npm, or administrator account is required.
 set -euo pipefail
 
-SETUP_VERSION=v0.3.0
+SETUP_VERSION=v0.3.1
 PI_RELEASE=https://github.com/earendil-works/pi/releases/latest/download
 OMP_RELEASE=https://github.com/can1357/oh-my-pi/releases/latest/download
 
